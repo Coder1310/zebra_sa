@@ -1,292 +1,505 @@
+#!/usr/bin/env python3
 from __future__ import annotations
 
 import asyncio
 import os
-import subprocess
-import sys
-import traceback
+import time
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import requests
-from aiogram import Bot, Dispatcher
+import yaml
+from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
-from aiogram.types import FSInputFile, Message
+from aiogram.types import Message, CallbackQuery, FSInputFile
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 
 ROOT_DIR = Path(__file__).resolve().parent
-LOG_DIR = ROOT_DIR / "data" / "logs"
+DATA_DIR = ROOT_DIR / "data"
+LOGS_DIR = DATA_DIR / "logs"
+BOT_STATE_PATH = LOGS_DIR / "bot_state.yaml"
+
+API_BASE = os.getenv("ZEBRA_API", "http://127.0.0.1:8000")
 
 
 @dataclass
-class RunCfg:
-  agents: int = 1000
+class Defaults:
+  players: int = 6
   houses: int = 6
-  days: int = 200
+  days: int = 50
   share: str = "meet"
   noise: float = 0.2
-  seed: int | None = None
-  t: int = 500
+  graph: str = "ring"        # ring | full
+  time_delay_sec: int = 60
+  strategy_delay_sec: int = 60
+  slow_sleep_ms: int = 0     # 0 = fast
 
 
-def _parse_kv(tokens: list[str]) -> dict[str, str]:
-  out: dict[str, str] = {}
-  for t in tokens:
-    if "=" not in t:
-      continue
-    k, v = t.split("=", 1)
-    k = k.strip().lower()
-    v = v.strip()
-    if k:
-      out[k] = v
-  return out
+DEFAULTS = Defaults()
+ROLES_6 = ["Russian", "Englishman", "Chinese", "German", "French", "American"]
+
+router = Router()
+BOT: Bot
 
 
-def _parse_run_args(text: str) -> RunCfg:
-  tokens = [t for t in text.strip().split() if t]
-  cfg = RunCfg()
+def _load_state() -> dict[str, Any]:
+  if not BOT_STATE_PATH.exists():
+    return {}
+  try:
+    return yaml.safe_load(BOT_STATE_PATH.read_text(encoding="utf-8")) or {}
+  except Exception:
+    return {}
 
-  kv = _parse_kv(tokens)
-  if "agents" in kv:
-    cfg.agents = int(kv["agents"])
-  if "houses" in kv:
-    cfg.houses = int(kv["houses"])
-  if "days" in kv:
-    cfg.days = int(kv["days"])
-  if "share" in kv:
-    cfg.share = kv["share"]
-  if "noise" in kv:
-    cfg.noise = float(kv["noise"])
-  if "seed" in kv:
-    cfg.seed = int(kv["seed"])
-  if "t" in kv:
-    cfg.t = int(kv["t"])
 
-  pos = [t for t in tokens if "=" not in t]
-  if pos:
+def _save_state(state: dict[str, Any]) -> None:
+  BOT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+  BOT_STATE_PATH.write_text(
+    yaml.safe_dump(state, allow_unicode=True, sort_keys=False),
+    encoding="utf-8",
+  )
+
+
+def _get_game(state: dict[str, Any], chat_id: int) -> Optional[dict[str, Any]]:
+  return (state.get("games") or {}).get(str(chat_id))
+
+
+def _set_game(state: dict[str, Any], chat_id: int, game: Optional[dict[str, Any]]) -> None:
+  state.setdefault("games", {})
+  if game is None:
+    state["games"].pop(str(chat_id), None)
+  else:
+    state["games"][str(chat_id)] = game
+
+
+def _preset_strategy(role: str, preset: str) -> dict[str, Any]:
+  base = {
+    "Russian": {"p_to": [0, 20, 0, 20, 20, 40], "p_house_exch": 10, "p_pet_exch": 10},
+    "Englishman": {"p_to": [0, 0, 30, 30, 10, 30], "p_house_exch": 10, "p_pet_exch": 0},
+    "Chinese": {"p_to": [0, 0, 0, 30, 60, 10], "p_house_exch": 0, "p_pet_exch": 20},
+    "German": {"p_to": [0, 0, 0, 80, 10, 10], "p_house_exch": 10, "p_pet_exch": 10},
+    "French": {"p_to": [10, 20, 0, 0, 0, 70], "p_house_exch": 10, "p_pet_exch": 20},
+    "American": {"p_to": [10, 30, 0, 10, 10, 40], "p_house_exch": 10, "p_pet_exch": 10},
+  }.get(role, {"p_to": [17, 17, 16, 17, 17, 16], "p_house_exch": 0, "p_pet_exch": 0})
+
+  if preset == "default":
+    return dict(base)
+
+  if preset == "explorer":
+    s = dict(base)
+    s["p_house_exch"] = max(0, int(s["p_house_exch"]) - 5)
+    s["p_pet_exch"] = max(0, int(s["p_pet_exch"]) - 5)
+    p = list(s["p_to"])
+    if len(p) == 6:
+      p[5] += 10
+      p[0] += 5
+      p[1] += 5
+      p[2] = max(0, p[2] - 10)
+      p[3] = max(0, p[3] - 5)
+      p[4] = max(0, p[4] - 5)
+    s["p_to"] = p
+    return s
+
+  if preset == "trader":
+    s = dict(base)
+    s["p_house_exch"] = min(100, int(s["p_house_exch"]) + 15)
+    s["p_pet_exch"] = min(100, int(s["p_pet_exch"]) + 15)
+    return s
+
+  return dict(base)
+
+
+def _kb_lobby(game_id: str) -> Any:
+  kb = InlineKeyboardBuilder()
+  kb.button(text="✅ Join", callback_data=f"game:{game_id}:join")
+  kb.button(text="❌ Leave", callback_data=f"game:{game_id}:leave")
+  kb.button(text="🚀 Start now (host)", callback_data=f"game:{game_id}:start")
+  kb.button(text="🛑 Cancel (host)", callback_data=f"game:{game_id}:cancel")
+  kb.adjust(2, 2)
+  return kb.as_markup()
+
+
+def _kb_presets(game_id: str) -> Any:
+  kb = InlineKeyboardBuilder()
+  kb.button(text="Default", callback_data=f"game:{game_id}:preset:default")
+  kb.button(text="Explorer", callback_data=f"game:{game_id}:preset:explorer")
+  kb.button(text="Trader", callback_data=f"game:{game_id}:preset:trader")
+  kb.adjust(3)
+  return kb.as_markup()
+
+
+def _format_lobby(game: dict[str, Any]) -> str:
+  players = game.get("players", {})
+  need = int(game["settings"]["players"])
+  cur = len(players)
+
+  dl = float(game.get("deadline_at", 0))
+  left = max(0, int(dl - time.time()))
+
+  lines = []
+  lines.append("🎮 ZEBRA: лобби")
+  lines.append(f"Игроки: {cur}/{need}")
+  for p in players.values():
+    lines.append(f"- {p.get('name', 'user')}")
+  lines.append(f"Старт через: {left} сек")
+  lines.append("")
+  lines.append("Нажми Join. Кто не успеет - будет заменен ботом.")
+  return "\n".join(lines)
+
+
+def _api_create_session(cfg: dict[str, Any]) -> str:
+  r = requests.post(f"{API_BASE}/session/create", json=cfg, timeout=60)
+  r.raise_for_status()
+  return r.json()["session_id"]
+
+
+def _api_run_session(session_id: str) -> dict[str, Any]:
+  r = requests.post(f"{API_BASE}/session/{session_id}/run", timeout=60 * 30)
+  r.raise_for_status()
+  return r.json()
+
+
+def _zip_files(zip_path: Path, paths: list[Path]) -> None:
+  zip_path.parent.mkdir(parents=True, exist_ok=True)
+  with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+    for p in paths:
+      if p.exists():
+        zf.write(p, arcname=p.name)
+
+
+@router.message(Command("start"))
+async def cmd_start(m: Message) -> None:
+  await m.answer("Команды: /game, /help")
+
+
+@router.message(Command("help"))
+async def cmd_help(m: Message) -> None:
+  await m.answer(
+    "🎮 /game - создать лобби и сыграть\n"
+    "Служебное:\n"
+    "/run - запуск дефолтной симуляции (без лобби)\n"
+  )
+
+
+@router.message(Command("game"))
+async def cmd_game(m: Message) -> None:
+  state = _load_state()
+  chat_id = m.chat.id
+
+  if _get_game(state, chat_id) is not None:
+    await m.answer("В этом чате уже есть активная игра. Отмени кнопкой Cancel.")
+    return
+
+  game_id = str(int(time.time()))
+  settings = asdict(DEFAULTS)
+
+  game = {
+    "id": game_id,
+    "chat_id": chat_id,
+    "host_id": m.from_user.id,
+    "created_at": time.time(),
+    "deadline_at": time.time() + int(settings["time_delay_sec"]),
+    "stage": "lobby",
+    "settings": settings,
+    "players": {
+      str(m.from_user.id): {
+        "name": (m.from_user.username or m.from_user.full_name or "host"),
+        "preset": "default",
+      }
+    },
+  }
+
+  _set_game(state, chat_id, game)
+  _save_state(state)
+
+  msg = await m.answer(_format_lobby(game), reply_markup=_kb_lobby(game_id))
+  game["lobby_msg_id"] = msg.message_id
+  _set_game(state, chat_id, game)
+  _save_state(state)
+
+  delay = int(settings["time_delay_sec"]) + 1
+  asyncio.create_task(_auto_start_lobby(chat_id, game_id, delay))
+
+
+async def _auto_start_lobby(chat_id: int, game_id: str, delay_sec: int) -> None:
+  await asyncio.sleep(delay_sec)
+
+  state = _load_state()
+  game = _get_game(state, chat_id)
+  if not game or game.get("id") != game_id:
+    return
+  if game.get("stage") != "lobby":
+    return
+
+  await _start_game(chat_id, game_id)
+
+
+@router.callback_query()
+async def on_cb(q: CallbackQuery) -> None:
+  data = q.data or ""
+  if not data.startswith("game:"):
+    await q.answer()
+    return
+
+  parts = data.split(":")
+  if len(parts) < 3:
+    await q.answer()
+    return
+
+  game_id = parts[1]
+  action = parts[2]
+
+  state = _load_state()
+  chat_id = q.message.chat.id if q.message else q.from_user.id
+  game = _get_game(state, chat_id)
+  if not game or game.get("id") != game_id:
+    await q.answer("Игра не найдена")
+    return
+
+  host_id = int(game["host_id"])
+  uid = q.from_user.id
+
+  if action == "join":
+    if game.get("stage") != "lobby":
+      await q.answer("Лобби уже закрыто")
+      return
+    players = game.setdefault("players", {})
+    if str(uid) not in players:
+      need = int(game["settings"]["players"])
+      if len(players) >= need:
+        await q.answer("Нет мест")
+        return
+      players[str(uid)] = {
+        "name": (q.from_user.username or q.from_user.full_name or "user"),
+        "preset": "default",
+      }
+    _set_game(state, chat_id, game)
+    _save_state(state)
+    await _refresh_lobby(q, game)
+    await q.answer("Ок")
+    return
+
+  if action == "leave":
+    if game.get("stage") != "lobby":
+      await q.answer("Лобби уже закрыто")
+      return
+    if str(uid) == str(host_id):
+      await q.answer("Хост не может выйти. Нажми Cancel.")
+      return
+    game.get("players", {}).pop(str(uid), None)
+    _set_game(state, chat_id, game)
+    _save_state(state)
+    await _refresh_lobby(q, game)
+    await q.answer("Ок")
+    return
+
+  if action == "start":
+    if uid != host_id:
+      await q.answer("Только хост")
+      return
+    await q.answer("Запускаю")
+    await _start_game(chat_id, game_id)
+    return
+
+  if action == "cancel":
+    if uid != host_id:
+      await q.answer("Только хост")
+      return
+    _set_game(state, chat_id, None)
+    _save_state(state)
     try:
-      if len(pos) >= 1:
-        cfg.agents = int(pos[0])
-      if len(pos) >= 2:
-        cfg.houses = int(pos[1])
-      if len(pos) >= 3:
-        cfg.days = int(pos[2])
-      if len(pos) >= 4:
-        cfg.share = pos[3]
-      if len(pos) >= 5:
-        cfg.noise = float(pos[4])
-      if len(pos) >= 6:
-        cfg.seed = int(pos[5])
-      if len(pos) >= 7:
-        cfg.t = int(pos[6])
+      if q.message:
+        await q.message.edit_text("Игра отменена.")
     except Exception:
       pass
+    await q.answer("Ок")
+    return
 
-  return cfg
+  if action == "preset":
+    if game.get("stage") != "strategy":
+      await q.answer("Сейчас нельзя")
+      return
+    if len(parts) != 4:
+      await q.answer()
+      return
+    preset = parts[3]
+    game["players"].setdefault(str(uid), {"name": "user"})["preset"] = preset
+    _set_game(state, chat_id, game)
+    _save_state(state)
+    await q.answer(f"Preset: {preset}")
+    return
+
+  await q.answer()
 
 
-def _post_json(url: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
-  r = requests.post(url, json=payload, timeout=timeout)
-  r.raise_for_status()
-  data = r.json()
-  if not isinstance(data, dict):
-    raise RuntimeError(f"bad json from {url}: {data}")
-  return data
+async def _refresh_lobby(q: CallbackQuery, game: dict[str, Any]) -> None:
+  try:
+    if q.message:
+      await q.message.edit_text(_format_lobby(game), reply_markup=_kb_lobby(game["id"]))
+  except Exception:
+    pass
 
 
-def _create_session(api: str, cfg: RunCfg) -> str:
-  payload: dict[str, Any] = {
-    "agents": cfg.agents,
-    "houses": cfg.houses,
-    "days": cfg.days,
-    "share": cfg.share,
-    "noise": cfg.noise,
+async def _start_game(chat_id: int, game_id: str) -> None:
+  state = _load_state()
+  game = _get_game(state, chat_id)
+  if not game or game.get("id") != game_id:
+    return
+  if game.get("stage") != "lobby":
+    return
+
+  game["stage"] = "strategy"
+  game["strategy_deadline_at"] = time.time() + int(game["settings"]["strategy_delay_sec"])
+  _set_game(state, chat_id, game)
+  _save_state(state)
+
+  players = list(game["players"].items())
+  need = int(game["settings"]["players"])
+
+  humans = players[:need]
+  roles = ROLES_6[:need]
+
+  for i, (uid, p) in enumerate(humans):
+    p["role"] = roles[i]
+
+  bots_cnt = need - len(humans)
+  for j in range(bots_cnt):
+    game["players"][f"bot{j}"] = {
+      "name": f"bot{j}",
+      "role": roles[len(humans) + j],
+      "preset": "default",
+      "bot": True,
+    }
+
+  _set_game(state, chat_id, game)
+  _save_state(state)
+
+  lines = ["🎮 Игра начинается!", "Роли:"]
+  for p in game["players"].values():
+    lines.append(f"- {p['name']} -> {p['role']}")
+  lines.append("")
+  lines.append("Выбери стиль (кнопки) в течение TimeDelay. Кто не выберет - Default.")
+
+  await BOT.send_message(chat_id, "\n".join(lines), reply_markup=_kb_presets(game_id))
+
+  delay = int(game["settings"]["strategy_delay_sec"]) + 1
+  asyncio.create_task(_auto_run_after_strategy(chat_id, game_id, delay))
+
+
+async def _auto_run_after_strategy(chat_id: int, game_id: str, delay_sec: int) -> None:
+  await asyncio.sleep(delay_sec)
+
+  state = _load_state()
+  game = _get_game(state, chat_id)
+  if not game or game.get("id") != game_id:
+    return
+  if game.get("stage") != "strategy":
+    return
+
+  game["stage"] = "running"
+  _set_game(state, chat_id, game)
+  _save_state(state)
+
+  strategies: dict[str, dict[str, Any]] = {}
+  for p in game["players"].values():
+    role = p.get("role")
+    if not role:
+      continue
+    preset = p.get("preset", "default")
+    strategies[role] = _preset_strategy(role, preset)
+
+  cfg = {
+    "agents": int(game["settings"]["players"]),
+    "houses": int(game["settings"]["houses"]),
+    "days": int(game["settings"]["days"]),
+    "share": str(game["settings"]["share"]),
+    "noise": float(game["settings"]["noise"]),
+    "graph": str(game["settings"]["graph"]),
+    "use_zebra_defaults": True,
+    "strategies": strategies,
+    "sleep_ms_per_day": int(game["settings"]["slow_sleep_ms"]),
   }
-  if cfg.seed is not None:
-    payload["seed"] = cfg.seed
 
-  last_err: Exception | None = None
-  for path in ("/session/create", "/session"):
-    try:
-      data = _post_json(f"{api}{path}", payload, timeout=30.0)
-      sid = data.get("session_id")
-      if isinstance(sid, str) and sid:
-        return sid
-      raise RuntimeError(f"no session_id in response: {data}")
-    except Exception as e:
-      last_err = e
+  await BOT.send_message(chat_id, "⏳ Запускаю симуляцию...")
 
-  raise RuntimeError(f"cannot create session, last error: {last_err}")
+  try:
+    sid = _api_create_session(cfg)
+    res = _api_run_session(sid)
 
+    metrics = Path(res["metrics"])
+    events = Path(res["csv"])
+    xml = Path(res["xml"])
 
-def _start_session(api: str, sid: str, timeout: float) -> dict[str, Any]:
-  last_err: Exception | None = None
-  for path in (f"/session/{sid}/run", f"/session/{sid}/start"):
-    try:
-      r = requests.post(f"{api}{path}", timeout=timeout)
-      r.raise_for_status()
-      data = r.json()
-      if not isinstance(data, dict):
-        raise RuntimeError(f"bad json from {path}: {data}")
-      return data
-    except Exception as e:
-      last_err = e
-  raise RuntimeError(f"cannot start session, last error: {last_err}")
+    header = metrics.read_text(encoding="utf-8").splitlines()[0].split(",")[1:]
+    last_line = metrics.read_text(encoding="utf-8").strip().splitlines()[-1]
+    vals = [float(x) for x in last_line.split(",")[1:]]
+    rating = sorted(zip(header, vals), key=lambda x: x[1], reverse=True)
+
+    text = ["🏁 Результаты (M1 в последний день):"]
+    for i, (n, v) in enumerate(rating, start=1):
+      text.append(f"{i}) {n}: {v:.3f}")
+    text.append("")
+    text.append("Логи отправляю архивом.")
+    await BOT.send_message(chat_id, "\n".join(text))
+
+    zip_path = LOGS_DIR / f"game_{sid}.zip"
+    _zip_files(zip_path, [metrics, events, xml])
+    await BOT.send_document(chat_id, FSInputFile(str(zip_path)))
 
 
-def _ensure_file(path: str) -> Path:
-  p = Path(path)
-  if not p.is_absolute():
-    p = (ROOT_DIR / p).resolve()
-  if not p.exists():
-    raise FileNotFoundError(str(p))
-  return p
+  except Exception as e:
+    await BOT.send_message(chat_id, f"Ошибка запуска: {e}")
+
+  state = _load_state()
+  _set_game(state, chat_id, None)
+  _save_state(state)
 
 
-def _count_lines(path: Path, limit: int = 2_000_000) -> int:
-  n = 0
-  with path.open("rb") as f:
-    for _ in f:
-      n += 1
-      if n >= limit:
-        break
-  return n
+@router.message(Command("run"))
+async def cmd_run(m: Message) -> None:
+  cfg = {
+    "agents": 6,
+    "houses": 6,
+    "days": 50,
+    "share": "meet",
+    "noise": 0.2,
+    "graph": "ring",
+    "use_zebra_defaults": True,
+  }
+  await m.answer("⏳ Запускаю дефолтную симуляцию...")
+  try:
+    sid = _api_create_session(cfg)
+    res = _api_run_session(sid)
+    metrics = Path(res["metrics"])
+    events = Path(res["csv"])
+    xml = Path(res["xml"])
+    zip_path = LOGS_DIR / f"run_{sid}.zip"
+    _zip_files(zip_path, [metrics, events, xml])
+    await m.answer_document(FSInputFile(str(zip_path)))
+  except Exception as e:
+    await m.answer(f"Ошибка: {e}")
 
 
-def _pick_t(events: Path, requested_t: int) -> int:
-  # events: csv with header, so lines-1 = number of events
-  lines = _count_lines(events)
-  events_n = max(0, lines - 1)
-  if events_n <= 0:
-    return max(1, requested_t)
-  return max(1, min(requested_t, events_n))
+def _env(name: str) -> str:
+  v = os.getenv(name)
+  if not v:
+    raise RuntimeError(f"env {name} is required")
+  return v
 
 
-def _run_process_log(metrics: Path, events: Path, out_dir: Path, t: int) -> None:
-  out_dir.mkdir(parents=True, exist_ok=True)
-  cmd = [
-    sys.executable, "-m", "analysis.process_log",
-    "--metrics", str(metrics),
-    "--events", str(events),
-    "--t", str(t),
-    "--out_dir", str(out_dir),
-  ]
-  r = subprocess.run(cmd, text=True, capture_output=True)
-  if r.returncode != 0:
-    stdout_tail = (r.stdout or "")[-2000:]
-    stderr_tail = (r.stderr or "")[-2000:]
-    raise RuntimeError(
-      f"process_log failed rc={r.returncode}\n"
-      f"cmd={' '.join(cmd)}\n"
-      f"stdout_tail:\n{stdout_tail}\n"
-      f"stderr_tail:\n{stderr_tail}"
-    )
+async def main() -> None:
+  token = _env("BOT_TOKEN")
+  bot = Bot(token=token)
 
-
-def _zip_awareness(out_dir: Path, sid: str) -> Path:
-  zip_path = out_dir / f"awareness_{sid}.zip"
-  summary_path = out_dir / f"game_{sid}_summary.yaml"
-
-  with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-    for p in sorted(out_dir.glob("awareness-*.csv")):
-      z.write(p, arcname=p.name)
-    for p in sorted(out_dir.glob("awareness-*.yaml")):
-      z.write(p, arcname=p.name)
-    if summary_path.exists():
-      z.write(summary_path, arcname=summary_path.name)
-
-  return zip_path
-
-
-async def cmd_help(message: Message) -> None:
-  txt = (
-    "Команды:\n"
-    "/run agents houses days share noise seed t\n"
-    "/run agents = 1000 houses = 6 days = 200 share = meet noise = 0.2 seed = 1 t = 500\n\n"
-    "Примеры:\n"
-    "/run 50 6 50 meet 0.2\n"
-    "/run 50 6 50 meet 0.2 t = 200\n"
-  )
-  await message.answer(txt)
-
-
-async def cmd_run(message: Message, bot: Bot) -> None:
-  api = os.getenv("ZEBRA_API", "http://127.0.0.1:8000")
-  text = message.text or ""
-  args_text = text.replace("/run", "", 1).strip()
-  cfg = _parse_run_args(args_text)
-
-  await message.answer(
-    f"Запуск: agents = {cfg.agents} houses = {cfg.houses} days = {cfg.days} share = {cfg.share} noise = {cfg.noise} seed = {cfg.seed} t = {cfg.t}"
-  )
-
-  async def job() -> None:
-    try:
-      sid = await asyncio.to_thread(_create_session, api, cfg)
-      await bot.send_message(message.chat.id, f"session = {sid} стартую")
-
-      data = await asyncio.to_thread(_start_session, api, sid, 1800.0)
-
-      csv_path = data.get("csv")
-      metrics_path = data.get("metrics")
-      if not isinstance(csv_path, str) or not isinstance(metrics_path, str):
-        raise RuntimeError(f"server ответил без путей csv/metrics: {data}")
-
-      events = await asyncio.to_thread(_ensure_file, csv_path)
-      metrics = await asyncio.to_thread(_ensure_file, metrics_path)
-
-      t_eff = await asyncio.to_thread(_pick_t, events, cfg.t)
-
-      out_dir = LOG_DIR / f"bot_{sid}"
-      await asyncio.to_thread(_run_process_log, metrics, events, out_dir, t_eff)
-
-      summary = out_dir / f"game_{sid}_summary.yaml"
-      if not summary.exists():
-        raise FileNotFoundError(str(summary))
-
-      aw_zip = await asyncio.to_thread(_zip_awareness, out_dir, sid)
-
-      await bot.send_message(message.chat.id, f"session={sid} готово, отправляю файлы (t={t_eff})")
-
-      await bot.send_document(message.chat.id, FSInputFile(str(metrics), filename=metrics.name))
-      await bot.send_document(message.chat.id, FSInputFile(str(summary), filename=summary.name))
-
-      if aw_zip.stat().st_size <= 45 * 1024 * 1024:
-        await bot.send_document(message.chat.id, FSInputFile(str(aw_zip), filename=aw_zip.name))
-      else:
-        await bot.send_message(
-          message.chat.id,
-          f"awareness zip слишком большой ({aw_zip.stat().st_size / (1024*1024):.1f} MB), не отправляю"
-        )
-
-      await bot.send_message(message.chat.id, f"Готово: session={sid}")
-    except Exception:
-      err = traceback.format_exc()
-      await bot.send_message(message.chat.id, f"Ошибка:\n{err[-3500:]}")
-
-  asyncio.create_task(job())
-
-
-def main() -> None:
-  token = os.getenv("TG_TOKEN", "").strip()
-  if not token:
-    raise SystemExit("TG_TOKEN пуст. export TG_TOKEN=...")
+  global BOT
+  BOT = bot
 
   dp = Dispatcher()
-
-  @dp.message(Command("help"))
-  async def _h(message: Message) -> None:
-    await cmd_help(message)
-
-  @dp.message(Command("run"))
-  async def _r(message: Message, bot: Bot) -> None:
-    await cmd_run(message, bot)
-
-  bot = Bot(token=token)
-  asyncio.run(dp.start_polling(bot))
+  dp.include_router(router)
+  await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-  main()
+  asyncio.run(main())
