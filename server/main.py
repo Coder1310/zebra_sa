@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from simulator.engine import run_session
+from simulator.interactive_game import InteractiveGame, Action
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -17,7 +18,6 @@ LOG_DIR = ROOT_DIR / "data" / "logs"
 
 class MTStrategy(BaseModel):
   model_config = ConfigDict(extra="allow")
-
   p_to: Optional[list[int]] = None
   p_house_exch: Optional[int] = None
   p_pet_exch: Optional[int] = None
@@ -57,32 +57,65 @@ class RunResponse(BaseModel):
   finished_at: float
 
 
+class HumanPlayer(BaseModel):
+  user_id: int
+  name: str
+  role: str
+
+
+class CreateGameRequest(BaseModel):
+  model_config = ConfigDict(extra="allow")
+
+  agents: int = Field(default=6, ge=3, le=20)
+  houses: int = Field(default=6, ge=2, le=50)
+  days: int = Field(default=50, ge=1, le=20000)
+
+  share: str = Field(default="meet")
+  noise: float = Field(default=0.2, ge=0.0, le=1.0)
+  seed: Optional[int] = None
+
+  graph: str = Field(default="ring")  # ring | full
+  strategies: Optional[dict[str, dict[str, Any]]] = None
+
+  humans: list[HumanPlayer]
+
+
+class CreateGameResponse(BaseModel):
+  game_id: str
+
+
+class ActionRequest(BaseModel):
+  user_id: int
+  kind: str
+  dst: Optional[int] = None
+
+
+class StepResponse(BaseModel):
+  game_id: str
+  done: bool
+  day_finished: Optional[int] = None
+  leaderboard: Optional[list[list[Any]]] = None
+  files: Optional[dict[str, str]] = None
+  pending_user_ids: list[int] = []
+
+
+class StateResponse(BaseModel):
+  game_id: str
+  day: int
+  days_total: int
+  graph: str
+  pending_user_ids: list[int]
+  m1: dict[str, float]
+
+
 app = FastAPI(title="Zebra SA Server")
 
 _sessions: dict[str, dict[str, Any]] = {}
+_games: dict[str, InteractiveGame] = {}
 
 
-def _new_sid() -> str:
+def _new_id() -> str:
   return uuid.uuid4().hex[:12]
-
-
-def _normalize_cfg(req: CreateSessionRequest) -> dict[str, Any]:
-  cfg = req.model_dump()
-
-  mt_strategy = cfg.get("mt_strategy")
-  if isinstance(mt_strategy, BaseModel):
-    cfg["mt_strategy"] = mt_strategy.model_dump()
-
-  return cfg
-
-
-def _save_session(sid: str, cfg: dict[str, Any]) -> None:
-  _sessions[sid] = {
-    "created_at": time.time(),
-    "cfg": cfg,
-    "done": False,
-    "files": None,
-  }
 
 
 @app.get("/health")
@@ -90,21 +123,17 @@ def health() -> dict[str, str]:
   return {"status": "ok"}
 
 
-@app.post("/session", response_model=CreateSessionResponse)
-def create_session_alt(req: CreateSessionRequest) -> CreateSessionResponse:
-  return create_session(req)
-
-
 @app.post("/session/create", response_model=CreateSessionResponse)
 def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
   LOG_DIR.mkdir(parents=True, exist_ok=True)
-  sid = _new_sid()
-  cfg = _normalize_cfg(req)
-  _save_session(sid, cfg)
+  sid = _new_id()
+  cfg = req.model_dump()
+  _sessions[sid] = {"created_at": time.time(), "cfg": cfg, "done": False, "files": None}
   return CreateSessionResponse(session_id=sid)
 
 
-def _run_and_return(sid: str) -> RunResponse:
+@app.post("/session/{sid}/run", response_model=RunResponse)
+def run_session_endpoint(sid: str) -> RunResponse:
   s = _sessions.get(sid)
   if s is None:
     raise HTTPException(status_code=404, detail="unknown session_id")
@@ -136,11 +165,85 @@ def _run_and_return(sid: str) -> RunResponse:
   )
 
 
-@app.post("/session/{sid}/run", response_model=RunResponse)
-def run_session_endpoint(sid: str) -> RunResponse:
-  return _run_and_return(sid)
+@app.post("/game/create", response_model=CreateGameResponse)
+def create_game(req: CreateGameRequest) -> CreateGameResponse:
+  LOG_DIR.mkdir(parents=True, exist_ok=True)
+  gid = _new_id()
+
+  humans_map: dict[int, str] = {}
+  for p in req.humans:
+    humans_map[int(p.user_id)] = str(p.role)
+
+  cfg = req.model_dump()
+  game = InteractiveGame(game_id=gid, cfg=cfg, humans=humans_map, log_dir=LOG_DIR)
+  _games[gid] = game
+
+  return CreateGameResponse(game_id=gid)
 
 
-@app.post("/session/{sid}/start", response_model=RunResponse)
-def start_session_endpoint(sid: str) -> RunResponse:
-  return _run_and_return(sid)
+@app.get("/game/{gid}/state", response_model=StateResponse)
+def game_state(gid: str) -> StateResponse:
+  game = _games.get(gid)
+  if game is None:
+    raise HTTPException(status_code=404, detail="unknown game_id")
+  s = game.state()
+  return StateResponse(
+    game_id=s["game_id"],
+    day=int(s["day"]),
+    days_total=int(s["days_total"]),
+    graph=str(s["graph"]),
+    pending_user_ids=list(s["pending_user_ids"]),
+    m1={k: float(v) for k, v in s["m1"].items()},
+  )
+
+
+@app.post("/game/{gid}/action")
+def game_action(gid: str, req: ActionRequest) -> dict[str, Any]:
+  game = _games.get(gid)
+  if game is None:
+    raise HTTPException(status_code=404, detail="unknown game_id")
+
+  kind = str(req.kind)
+  if kind not in ("stay", "left", "right", "go_to", "house_exchange", "pet_exchange"):
+    raise HTTPException(status_code=400, detail="bad action kind")
+
+  game.set_action(int(req.user_id), Action(kind=kind, dst=req.dst))
+  s = game.state()
+  return {"ok": True, "pending_user_ids": list(s["pending_user_ids"])}
+
+
+@app.post("/game/{gid}/step", response_model=StepResponse)
+def game_step(gid: str) -> StepResponse:
+  game = _games.get(gid)
+  if game is None:
+    raise HTTPException(status_code=404, detail="unknown game_id")
+
+  result = game.step_day()
+  s2 = game.state() if not result.get("done") else {"pending_user_ids": []}
+
+  return StepResponse(
+    game_id=gid,
+    done=bool(result.get("done")),
+    day_finished=int(result.get("day_finished")) if result.get("day_finished") is not None else None,
+    leaderboard=[[name, float(val)] for name, val in (result.get("leaderboard") or [])],
+    files=result.get("files"),
+    pending_user_ids=list(s2.get("pending_user_ids", [])),
+  )
+
+
+@app.post("/game/{gid}/finish", response_model=StepResponse)
+def game_finish(gid: str) -> StepResponse:
+  game = _games.get(gid)
+  if game is None:
+    raise HTTPException(status_code=404, detail="unknown game_id")
+
+  result = game.finish_now()
+
+  return StepResponse(
+    game_id=gid,
+    done=True,
+    day_finished=int(result.get("day_finished")) if result.get("day_finished") is not None else None,
+    leaderboard=[[name, float(val)] for name, val in (result.get("leaderboard") or [])],
+    files=result.get("files"),
+    pending_user_ids=[],
+  )
