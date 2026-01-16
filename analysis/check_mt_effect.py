@@ -124,7 +124,7 @@ def _run_until_metrics(api: str, sid: str, logs_dir: str, wait_sec: float) -> st
       if f not in prev and os.path.getmtime(f) >= t_start - 0.2 and os.path.getsize(f) > 0
     ]
     if new_files:
-      return max(new_files, key=os.path.getmtime)
+      return max(new_files, key = os.path.getmtime)
 
     sleep_s = 0.2
     if isinstance(info, dict) and "deadline" in info:
@@ -143,7 +143,7 @@ def _parse_mt_best(path: str) -> tuple[str, dict]:
   strat: dict = {}
   try:
     import yaml  # type: ignore
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding = "utf-8") as f:
       y = yaml.safe_load(f)
     if isinstance(y, dict):
       who = str(y.get("who", who))
@@ -253,7 +253,7 @@ def main() -> None:
   print(f"baseline_sid = {baseline_sid}")
   print(f"baseline_metrics = {baseline_metrics}")
   print(f"baseline_final = {baseline_final:.6f}")
-  print(f"baseline_tail_mean(tail={args.tail}) = {baseline_tail:.6f}")
+  print(f"baseline_tail_mean(tail = {args.tail}) = {baseline_tail:.6f}")
   print(f"mt_sid = {mt_sid}")
   print(f"mt_metrics = {mt_metrics}")
   print(f"mt_final = {mt_final:.6f}")
@@ -263,7 +263,7 @@ def main() -> None:
   print(f"diff_vs_baseline = {mt_diff:.6g}")
 
   try:
-    import matplotlib.pyplot as plt  # type: ignore
+    import matplotlib.pyplot as plt
     x1 = [d for d, _ in baseline_series]
     y1 = [v for _, v in baseline_series]
     x2 = [d for d, _ in mt_series]

@@ -5,7 +5,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
 from simulator.engine import run_session
@@ -34,7 +34,7 @@ class CreateSessionRequest(BaseModel):
   noise: float = Field(default=0.2, ge=0.0, le=1.0)
   seed: Optional[int] = None
 
-  graph: str = Field(default="ring")  # ring | full
+  graph: str = Field(default="ring")
   use_zebra_defaults: bool = True
 
   strategies: Optional[dict[str, dict[str, Any]]] = None
@@ -74,7 +74,7 @@ class CreateGameRequest(BaseModel):
   noise: float = Field(default=0.2, ge=0.0, le=1.0)
   seed: Optional[int] = None
 
-  graph: str = Field(default="ring")  # ring | full
+  graph: str = Field(default="ring")
   strategies: Optional[dict[str, dict[str, Any]]] = None
 
   humans: list[HumanPlayer]
@@ -88,6 +88,7 @@ class ActionRequest(BaseModel):
   user_id: int
   kind: str
   dst: Optional[int] = None
+  target: Optional[str] = None
 
 
 class StepResponse(BaseModel):
@@ -97,6 +98,7 @@ class StepResponse(BaseModel):
   leaderboard: Optional[list[list[Any]]] = None
   files: Optional[dict[str, str]] = None
   pending_user_ids: list[int] = []
+  reports: Optional[dict[str, list[str]]] = None
 
 
 class StateResponse(BaseModel):
@@ -106,6 +108,32 @@ class StateResponse(BaseModel):
   graph: str
   pending_user_ids: list[int]
   m1: dict[str, float]
+
+
+class PlayerStateResponse(BaseModel):
+  ok: bool
+  reason: Optional[str] = None
+
+  role: Optional[str] = None
+  day: Optional[int] = None
+  days_total: Optional[int] = None
+  home: Optional[int] = None
+  location: Optional[int] = None
+  left_house: Optional[int] = None
+  right_house: Optional[int] = None
+  graph: Optional[str] = None
+
+  trip: Optional[dict[str, Any]] = None
+  pet: Optional[str] = None
+  drink: Optional[str] = None
+  smoke: Optional[str] = None
+  m1: Optional[float] = None
+
+  co_located_all: Optional[list[str]] = None
+  co_located_humans: Optional[list[str]] = None
+  pet_offers_in: Optional[list[str]] = None
+
+  knowledge: Optional[list[dict[str, Any]]] = None
 
 
 app = FastAPI(title="Zebra SA Server")
@@ -197,6 +225,16 @@ def game_state(gid: str) -> StateResponse:
   )
 
 
+@app.get("/game/{gid}/player_state", response_model=PlayerStateResponse)
+def game_player_state(gid: str, user_id: int = Query(...)) -> PlayerStateResponse:
+  game = _games.get(gid)
+  if game is None:
+    raise HTTPException(status_code=404, detail="unknown game_id")
+
+  s = game.player_state(int(user_id))
+  return PlayerStateResponse(**s)
+
+
 @app.post("/game/{gid}/action")
 def game_action(gid: str, req: ActionRequest) -> dict[str, Any]:
   game = _games.get(gid)
@@ -204,12 +242,16 @@ def game_action(gid: str, req: ActionRequest) -> dict[str, Any]:
     raise HTTPException(status_code=404, detail="unknown game_id")
 
   kind = str(req.kind)
-  if kind not in ("stay", "left", "right", "go_to", "house_exchange", "pet_exchange"):
+  allowed = {
+    "stay", "left", "right", "go_to",
+    "house_exchange", "pet_exchange",
+    "pet_offer", "pet_accept", "pet_decline",
+  }
+  if kind not in allowed:
     raise HTTPException(status_code=400, detail="bad action kind")
 
-  game.set_action(int(req.user_id), Action(kind=kind, dst=req.dst))
-  s = game.state()
-  return {"ok": True, "pending_user_ids": list(s["pending_user_ids"])}
+  res = game.set_action(int(req.user_id), Action(kind=kind, dst=req.dst, target=req.target))
+  return res
 
 
 @app.post("/game/{gid}/step", response_model=StepResponse)
@@ -228,6 +270,7 @@ def game_step(gid: str) -> StepResponse:
     leaderboard=[[name, float(val)] for name, val in (result.get("leaderboard") or [])],
     files=result.get("files"),
     pending_user_ids=list(s2.get("pending_user_ids", [])),
+    reports=result.get("reports") or {},
   )
 
 
@@ -246,4 +289,5 @@ def game_finish(gid: str) -> StepResponse:
     leaderboard=[[name, float(val)] for name, val in (result.get("leaderboard") or [])],
     files=result.get("files"),
     pending_user_ids=[],
+    reports=result.get("reports") or {},
   )

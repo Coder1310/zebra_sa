@@ -47,7 +47,7 @@ def main() -> None:
   ap = argparse.ArgumentParser()
   ap.add_argument("--none", required = True)
   ap.add_argument("--meet", required = True)
-  ap.add_argument("--metric", choices = ["any", "m1"], default="m1")
+  ap.add_argument("--metric", choices = ["any", "m1"], default = "m1")
   ap.add_argument("--out", required = True)
   args = ap.parse_args()
 

@@ -108,7 +108,7 @@ def main() -> None:
 
   delim = _detect_delimiter(args.metrics)
   with open(args.metrics, "r", encoding = "utf-8", newline = "") as f:
-    r = csv.DictReader(f, delimiter=delim)
+    r = csv.DictReader(f, delimiter = delim)
     if not r.fieldnames:
       raise SystemExit("empty metrics header")
 

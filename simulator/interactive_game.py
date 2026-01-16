@@ -45,8 +45,9 @@ class House:
 
 @dataclass
 class Action:
-  kind: str  # stay | left | right | go_to | house_exchange | pet_exchange
+  kind: str
   dst: Optional[int] = None
+  target: Optional[str] = None
 
 
 def _clamp_int(x: Any, lo: int, hi: int) -> int:
@@ -222,7 +223,7 @@ class InteractiveGame:
     self,
     game_id: str,
     cfg: dict[str, Any],
-    humans: dict[int, str],  # user_id -> agent_name (role)
+    humans: dict[int, str],  # user_id -> agent_name
     log_dir: Path,
   ) -> None:
     self.game_id = game_id
@@ -261,6 +262,9 @@ class InteractiveGame:
 
     self.pending_actions: dict[str, Action] = {}
 
+    # target -> set(offerers) для обмена питомцами (живые игроки)
+    self.pet_offers: dict[str, set[str]] = {}
+
     self.agents = self._init_agents()
     self._init_knowledge()
 
@@ -287,6 +291,9 @@ class InteractiveGame:
 
   def _by_home(self) -> dict[int, Agent]:
     return {a.home: a for a in self.agents}
+
+  def _by_name(self) -> dict[str, Agent]:
+    return {a.name: a for a in self.agents}
 
   def _log_event(self, day: int, kind: str, *args: Any) -> int:
     self.event_id += 1
@@ -324,6 +331,22 @@ class InteractiveGame:
     for a in self.agents:
       _observe_house(a, 0, a.home, self.houses, by_home)
 
+  def _neighbor_left(self, x: int) -> int:
+    return x - 1 if x > 1 else self.houses_n
+
+  def _neighbor_right(self, x: int) -> int:
+    return x + 1 if x < self.houses_n else 1
+
+  def _remove_offers_from(self, offerer: str) -> None:
+    for tgt, s in list(self.pet_offers.items()):
+      if offerer in s:
+        s.discard(offerer)
+      if not s:
+        self.pet_offers.pop(tgt, None)
+
+  def _remove_offers_to(self, target: str) -> None:
+    self.pet_offers.pop(target, None)
+
   def state(self) -> dict[str, Any]:
     by_home = self._by_home()
     m1s = {a.name: _m1(a, self.houses, by_home) for a in self.agents}
@@ -340,11 +363,133 @@ class InteractiveGame:
       "m1": m1s,
     }
 
-  def set_action(self, user_id: int, action: Action) -> None:
-    name = self.humans.get(user_id)
+  def player_state(self, user_id: int) -> dict[str, Any]:
+    role = self.humans.get(int(user_id))
+    if not role:
+      return {"ok": False, "reason": "not a human in this game"}
+
+    by_name = self._by_name()
+    me = by_name.get(role)
+    if me is None:
+      return {"ok": False, "reason": "role not found"}
+
+    by_home = self._by_home()
+    m1 = _m1(me, self.houses, by_home)
+
+    loc = me.location
+    left = self._neighbor_left(loc)
+    right = self._neighbor_right(loc)
+
+    co_located_all: list[str] = []
+    for a in self.agents:
+      if a.name == me.name:
+        continue
+      if a.trip.active:
+        continue
+      if a.location == loc:
+        co_located_all.append(a.name)
+
+    human_roles = set(self.humans.values())
+    co_located_humans = [x for x in co_located_all if x in human_roles]
+
+    offers_in = sorted(list(self.pet_offers.get(me.name, set())))
+    offers_in = [x for x in offers_in if x in human_roles]
+
+    knowledge_rows: list[dict[str, Any]] = []
+    for hid in range(1, self.houses_n + 1):
+      row = {"house": hid}
+      for cat in CATEGORIES:
+        e = me.knowledge.get((hid, cat))
+        row[cat] = e.value if e else None
+      knowledge_rows.append(row)
+
+    trip = {
+      "active": bool(me.trip.active),
+      "src": int(me.trip.src),
+      "dst": int(me.trip.dst),
+      "remaining": int(me.trip.remaining),
+    }
+
+    return {
+      "ok": True,
+      "role": me.name,
+      "day": int(self.day),
+      "days_total": int(self.days_total),
+      "home": int(me.home),
+      "location": int(me.location),
+      "left_house": int(left),
+      "right_house": int(right),
+      "graph": self.graph,
+      "trip": trip,
+      "pet": me.pet,
+      "drink": me.drink,
+      "smoke": me.smoke,
+      "m1": float(m1),
+      "co_located_all": co_located_all,
+      "co_located_humans": co_located_humans,
+      "pet_offers_in": offers_in,
+      "knowledge": knowledge_rows,
+    }
+
+  def set_action(self, user_id: int, action: Action) -> dict[str, Any]:
+    name = self.humans.get(int(user_id))
     if not name:
-      return
-    self.pending_actions[name] = action
+      return {"ok": False, "reason": "not a human"}
+
+    by_name = self._by_name()
+    me = by_name.get(name)
+    if me is None:
+      return {"ok": False, "reason": "role not found"}
+
+    kind = str(action.kind)
+
+    # decline - это "операция над предложением", не фиксируем ход
+    if kind == "pet_decline":
+      offerer = (action.target or "").strip()
+      if offerer:
+        s = self.pet_offers.get(name)
+        if s and offerer in s:
+          s.discard(offerer)
+          if not s:
+            self.pet_offers.pop(name, None)
+      return {"ok": True, "pending_user_ids": self.state()["pending_user_ids"]}
+
+    # любое "обычное" действие игрока - отменяет его исходящие офферы (если передумал)
+    self._remove_offers_from(name)
+
+    if kind == "pet_offer":
+      target = (action.target or "").strip()
+      if not target:
+        return {"ok": False, "reason": "no target"}
+
+      target_agent = by_name.get(target)
+      if target_agent is None:
+        return {"ok": False, "reason": "bad target"}
+
+      # только если оба стоят в одном доме и не в пути
+      if me.trip.active or target_agent.trip.active:
+        return {"ok": False, "reason": "someone is traveling"}
+      if me.location != target_agent.location:
+        return {"ok": False, "reason": "not in same house"}
+
+      # только между живыми игроками
+      if target not in set(self.humans.values()):
+        return {"ok": False, "reason": "target is not a human player"}
+
+      self.pet_offers.setdefault(target, set()).add(name)
+      self.pending_actions[name] = Action(kind="pet_offer", target=target)
+      return {"ok": True, "pending_user_ids": self.state()["pending_user_ids"]}
+
+    if kind == "pet_accept":
+      offerer = (action.target or "").strip()
+      if not offerer:
+        return {"ok": False, "reason": "no offerer"}
+      self.pending_actions[name] = Action(kind="pet_accept", target=offerer)
+      return {"ok": True, "pending_user_ids": self.state()["pending_user_ids"]}
+
+    # обычные перемещения/ожидание
+    self.pending_actions[name] = Action(kind=kind, dst=action.dst, target=action.target)
+    return {"ok": True, "pending_user_ids": self.state()["pending_user_ids"]}
 
   def finish_now(self) -> dict[str, Any]:
     if self.finished:
@@ -372,33 +517,29 @@ class InteractiveGame:
       "files": files,
       "day_finished": last_day,
       "leaderboard": leaderboard,
+      "reports": {},
     }
     return dict(self.finished_result)
 
-  def _neighbor_left(self, x: int) -> int:
-    return x - 1 if x > 1 else self.houses_n
-
-  def _neighbor_right(self, x: int) -> int:
-    return x + 1 if x < self.houses_n else 1
-
-  def _apply_exchange(self, day: int, kind: str, actor: Agent) -> None:
-    others = [a for a in self.agents if a.name != actor.name and (not a.trip.active)]
-    if not others:
-      return
-    b = self.rng.choice(others)
+  def _apply_exchange_bot(self, day: int, kind: str, actor: Agent) -> Optional[tuple[str, str]]:
+    # обмен ботами возможен только если в доме есть хотя бы 2 человека
+    if actor.trip.active:
+      return None
+    same_loc = [a for a in self.agents if (not a.trip.active) and a.location == actor.location and a.name != actor.name]
+    if not same_loc:
+      return None
+    b = self.rng.choice(same_loc)
 
     if kind == "house":
       a_home, b_home = actor.home, b.home
       actor.home, b.home = b_home, a_home
       self._log_event(day, "changeHouse", 2, actor.name, b.name, a_home, b_home)
-    else:
-      a_pet, b_pet = actor.pet, b.pet
-      actor.pet, b.pet = b_pet, a_pet
-      self._log_event(day, "changePet", 2, actor.name, b.name, a_pet, b_pet)
+      return (actor.name, b.name)
 
-    by_home = self._by_home()
-    _observe_house(actor, day, actor.home, self.houses, by_home)
-    _observe_house(b, day, b.home, self.houses, by_home)
+    a_pet, b_pet = actor.pet, b.pet
+    actor.pet, b.pet = b_pet, a_pet
+    self._log_event(day, "changePet", 2, actor.name, b.name, a_pet, b_pet)
+    return (actor.name, b.name)
 
   def _start_trip(self, day: int, agent: Agent, dst: int) -> None:
     if agent.trip.active:
@@ -448,10 +589,17 @@ class InteractiveGame:
       return dict(self.finished_result or {"done": True, "files": None})
 
     if self.day > self.days_total:
-      return {"done": True, "files": None}
+      return {"done": True, "files": None, "reports": {}}
 
     day = self.day
 
+    # снимок знаний до дня - для отчета "сколько новых фактов"
+    know_before = {a.name: set(a.knowledge.keys()) for a in self.agents}
+    loc_before = {a.name: a.location for a in self.agents}
+
+    arrived_ok_by_house: dict[int, list[str]] = {}
+
+    # 1) завершаем поездки
     arrived: list[Agent] = []
     for a in self.agents:
       if not a.trip.active:
@@ -472,37 +620,124 @@ class InteractiveGame:
       if ok == 0:
         a.location = a.trip.src
       self._log_event(day, "FinishTrip", a.trip.start_event_id, a.name, ok)
+      if ok == 1:
+        arrived_ok_by_house.setdefault(dst, []).append(a.name)
+
+    # 2) собираем действия (люди + боты)
+    actions: dict[str, Action] = {}
+
+    # люди
+    for uid, role in self.humans.items():
+      act = self.pending_actions.get(role)
+      if act is not None:
+        actions[role] = act
+
+    # боты
+    for a in self.agents:
+      if a.name in actions:
+        continue
+      if a.trip.active:
+        continue
+      actions[a.name] = self._bot_decision(a)
+
+    by_name = self._by_name()
+
+    # 3) обмен питомцами по согласию (живые игроки)
+    executed_pet_swaps: list[tuple[str, str]] = []
+    for accepter, act in list(actions.items()):
+      if act.kind != "pet_accept":
+        continue
+      offerer = (act.target or "").strip()
+      if not offerer:
+        continue
+      offer_act = actions.get(offerer)
+      if offer_act is None or offer_act.kind != "pet_offer":
+        continue
+      if (offer_act.target or "").strip() != accepter:
+        continue
+
+      a = by_name.get(offerer)
+      b = by_name.get(accepter)
+      if a is None or b is None:
+        continue
+      if a.trip.active or b.trip.active:
+        continue
+      if a.location != b.location:
+        continue
+
+      a_pet, b_pet = a.pet, b.pet
+      a.pet, b.pet = b_pet, a_pet
+      self._log_event(day, "changePet", 2, a.name, b.name, a_pet, b_pet)
+      executed_pet_swaps.append((a.name, b.name))
+
+      # после успешного обмена чистим офферы
+      self._remove_offers_from(a.name)
+      s = self.pet_offers.get(b.name)
+      if s and a.name in s:
+        s.discard(a.name)
+        if not s:
+          self.pet_offers.pop(b.name, None)
+
+    # 4) обработка остальных действий
+    started_trips: dict[str, int] = {}
+    executed_house_swaps_bot: list[tuple[str, str]] = []
+    executed_pet_swaps_bot: list[tuple[str, str]] = []
 
     for a in self.agents:
       if a.trip.active:
         continue
-
-      action = self.pending_actions.get(a.name)
-      if action is None:
-        action = self._bot_decision(a)
-
-      if action.kind == "house_exchange":
-        self._apply_exchange(day, "house", a)
-        continue
-      if action.kind == "pet_exchange":
-        self._apply_exchange(day, "pet", a)
+      act = actions.get(a.name)
+      if act is None:
         continue
 
-      if action.kind == "left":
-        self._start_trip(day, a, self._neighbor_left(a.location))
+      if act.kind == "house_exchange":
+        pair = self._apply_exchange_bot(day, "house", a)
+        if pair:
+          executed_house_swaps_bot.append(pair)
         continue
-      if action.kind == "right":
-        self._start_trip(day, a, self._neighbor_right(a.location))
+
+      if act.kind == "pet_exchange":
+        pair = self._apply_exchange_bot(day, "pet", a)
+        if pair:
+          executed_pet_swaps_bot.append(pair)
         continue
-      if action.kind == "go_to" and action.dst is not None:
+
+      if act.kind == "pet_offer":
+        # просто предложение - без движения
+        continue
+
+      if act.kind == "pet_accept":
+        # принятие тоже без движения
+        continue
+
+      if act.kind == "stay":
+        continue
+
+      if act.kind == "left":
+        dst = self._neighbor_left(a.location)
+        self._start_trip(day, a, dst)
+        started_trips[a.name] = dst
+        continue
+
+      if act.kind == "right":
+        dst = self._neighbor_right(a.location)
+        self._start_trip(day, a, dst)
+        started_trips[a.name] = dst
+        continue
+
+      if act.kind == "go_to" and act.dst is not None:
+        dst = int(act.dst)
         if self.graph == "full":
-          self._start_trip(day, a, int(action.dst))
+          self._start_trip(day, a, dst)
+          started_trips[a.name] = dst
         else:
-          dst = int(action.dst)
           if dst in (self._neighbor_left(a.location), self._neighbor_right(a.location)):
             self._start_trip(day, a, dst)
+            started_trips[a.name] = dst
         continue
 
+    # 5) встречи и обмен знаниями
+    met_today: dict[str, list[str]] = {a.name: [] for a in self.agents}
     if self.share == "meet":
       by_home = self._by_home()
       groups: dict[int, list[Agent]] = {}
@@ -515,6 +750,9 @@ class InteractiveGame:
         if len(group) < 2:
           continue
         for x in group:
+          met_today[x.name] = [y.name for y in group if y.name != x.name]
+
+        for x in group:
           _observe_house(x, day, loc, self.houses, by_home)
         for x in group:
           for y in group:
@@ -523,36 +761,97 @@ class InteractiveGame:
             _observe_person(x, day, y)
         _merge_knowledge(group)
 
+    # 6) шум
     if self.noise > 0.0:
       for a in self.agents:
         if self.rng.random() < self.noise and a.knowledge:
           k = self.rng.choice(list(a.knowledge.keys()))
           a.knowledge.pop(k, None)
 
+    # 7) метрики
     by_home = self._by_home()
     m1s: list[float] = []
+    m1_by_name: dict[str, float] = {}
     for a in self.agents:
-      m1s.append(_m1(a, self.houses, by_home))
+      v = _m1(a, self.houses, by_home)
+      m1s.append(v)
+      m1_by_name[a.name] = v
 
     if not self.metrics_rows:
       self.metrics_rows.append(["day"] + [a.name for a in self.agents])
     self.metrics_rows.append([str(day)] + [f"{x:.6f}" for x in m1s])
 
-    self.pending_actions = {}
-    self.day += 1
+    # 8) отчеты (повествование)
+    reports: dict[str, list[str]] = {}
+    total_facts = self.houses_n * len(CATEGORIES)
 
+    for a in self.agents:
+      lines: list[str] = []
+      lines.append(f"День {day}/{self.days_total}")
+      lines.append(f"Вы: {a.name}. Ваш дом: {a.home}. Сейчас: дом {a.location}.")
+
+      if a.trip.active:
+        lines.append(f"Вы отправились в дом {a.trip.dst} (осталось {a.trip.remaining} дн.).")
+      elif a.name in started_trips:
+        lines.append(f"Вы начали путь в дом {started_trips[a.name]}.")
+
+      visitors = arrived_ok_by_house.get(loc_before.get(a.name, a.location), [])
+      visitors = [x for x in visitors if x != a.name]
+      if visitors:
+        lines.append("К вам сегодня пришли: " + ", ".join(visitors) + ".")
+
+      met = met_today.get(a.name, [])
+      if met:
+        lines.append("Сегодня вы встретили: " + ", ".join(met) + ".")
+
+      # обмены питомцами по согласию
+      for x, y in executed_pet_swaps:
+        if a.name == x:
+          lines.append(f"Обмен питомцами: вы обменялись с {y}.")
+        if a.name == y:
+          lines.append(f"Обмен питомцами: вы обменялись с {x}.")
+
+      # бот-обмены (если были)
+      for x, y in executed_pet_swaps_bot:
+        if a.name == x:
+          lines.append(f"Случайный обмен питомцами (бот): с {y}.")
+        if a.name == y:
+          lines.append(f"Случайный обмен питомцами (бот): с {x}.")
+      for x, y in executed_house_swaps_bot:
+        if a.name == x:
+          lines.append(f"Случайный обмен домами (бот): с {y}.")
+        if a.name == y:
+          lines.append(f"Случайный обмен домами (бот): с {x}.")
+
+      after_keys = set(a.knowledge.keys())
+      new_keys = list(after_keys - know_before.get(a.name, set()))
+      new_cnt = len(new_keys)
+      known_cnt = len(after_keys)
+
+      lines.append(f"Новых фактов сегодня: {new_cnt}. Известно фактов: {known_cnt}/{total_facts}.")
+      lines.append(f"Текущий M1: {m1_by_name[a.name]:.3f}")
+
+      reports[a.name] = lines
+
+    # 9) чистим действия/офферы и идем дальше
+    self.pending_actions = {}
+    self.pet_offers = {}
+
+    self.day += 1
     done = self.day > self.days_total
+
     files = None
     if done:
       files = self._finalize()
 
-    leaderboard = sorted([(a.name, m1s[i]) for i, a in enumerate(self.agents)], key=lambda x: x[1], reverse=True)
+    leaderboard = sorted([(a.name, m1_by_name[a.name]) for a in self.agents], key=lambda x: x[1], reverse=True)
 
     return {
       "done": done,
       "files": files,
       "day_finished": day,
       "leaderboard": leaderboard,
+      "reports": reports,
     }
 
   def _finalize(self) -> dict[str, str]:
