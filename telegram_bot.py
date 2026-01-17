@@ -22,10 +22,10 @@ DATA_DIR = ROOT_DIR / "data"
 LOGS_DIR = DATA_DIR / "logs"
 STATE_PATH = LOGS_DIR / "bot_state.yaml"
 
-ROLES_6 = ["Russian", "Englishman", "Chinese", "German", "French", "American"]
-
 router = Router()
 BOT: Bot
+
+ROLES_6 = ["Russian", "Englishman", "Chinese", "German", "French", "American"]
 
 
 @dataclass
@@ -105,11 +105,13 @@ def _register_user(state: dict[str, Any], user: Any) -> None:
   }
 
 
-def _mention(user: dict[str, Any]) -> str:
-  u = user.get("username")
+def _mention(p: dict[str, Any]) -> str:
+  u = p.get("username")
   if u:
+    if u.startswith("@"):
+      return u
     return f"@{u}"
-  return user.get("name", "user")
+  return p.get("name", "user")
 
 
 def _zip_files(zip_path: Path, paths: list[Path]) -> None:
@@ -118,6 +120,33 @@ def _zip_files(zip_path: Path, paths: list[Path]) -> None:
     for p in paths:
       if p.exists():
         zf.write(p, arcname=p.name)
+
+
+def _get_lobby(state: dict[str, Any], lobby_id: str) -> Optional[dict[str, Any]]:
+  _ensure(state)
+  return state["lobbies"].get(str(lobby_id))
+
+
+def _set_lobby(state: dict[str, Any], lobby_id: str, lobby: Optional[dict[str, Any]]) -> None:
+  _ensure(state)
+  if lobby is None:
+    state["lobbies"].pop(str(lobby_id), None)
+  else:
+    state["lobbies"][str(lobby_id)] = lobby
+
+
+def _user_lobby_id(state: dict[str, Any], user_id: int) -> Optional[str]:
+  _ensure(state)
+  return state["user_to_lobby"].get(str(int(user_id)))
+
+
+def _set_user_lobby(state: dict[str, Any], user_id: int, lobby_id: Optional[str]) -> None:
+  _ensure(state)
+  key = str(int(user_id))
+  if lobby_id is None:
+    state["user_to_lobby"].pop(key, None)
+  else:
+    state["user_to_lobby"][key] = str(lobby_id)
 
 
 def _format_lobby(lobby: dict[str, Any]) -> str:
@@ -168,45 +197,6 @@ def _kb_finish_vote(lobby_id: str) -> Any:
   return kb.as_markup()
 
 
-def _kb_actions_for_player(gid: str, lobby_id: str, user_id: int, ps: dict[str, Any]) -> Any:
-  kb = InlineKeyboardBuilder()
-
-  graph = str(ps.get("graph", "ring"))
-  loc = int(ps.get("location", 1))
-  left = int(ps.get("left_house", 1))
-  right = int(ps.get("right_house", 1))
-
-  offers_in = ps.get("pet_offers_in") or []
-  co_humans = ps.get("co_located_humans") or []
-
-  kb.button(text="⏸ Stay", callback_data=f"act:{lobby_id}:{gid}:{user_id}:stay")
-  if graph != "full":
-    kb.button(text=f"⬅ Left (to {left})", callback_data=f"act:{lobby_id}:{gid}:{user_id}:left")
-    kb.button(text=f"➡ Right (to {right})", callback_data=f"act:{lobby_id}:{gid}:{user_id}:right")
-  else:
-    kb.button(text="🏃 Choose destination", callback_data=f"goto:{lobby_id}:{gid}:{user_id}:0")
-
-  if len(co_humans) > 0:
-    kb.button(text="🐾 Propose pet swap", callback_data=f"petmenu:{lobby_id}:{gid}:{user_id}")
-
-  for offerer in offers_in[:4]:
-    kb.button(text=f"✅ Accept swap from {offerer}", callback_data=f"act:{lobby_id}:{gid}:{user_id}:pet_accept:{offerer}")
-    kb.button(text=f"❌ Decline {offerer}", callback_data=f"act:{lobby_id}:{gid}:{user_id}:pet_decline:{offerer}")
-
-  kb.button(text="🛑 End game", callback_data=f"end:{lobby_id}:{gid}:{user_id}")
-  kb.adjust(2, 2, 2)
-  return kb.as_markup()
-
-
-def _kb_pet_targets(lobby_id: str, gid: str, user_id: int, targets: list[str]) -> Any:
-  kb = InlineKeyboardBuilder()
-  for t in targets[:8]:
-    kb.button(text=f"Swap with {t}", callback_data=f"act:{lobby_id}:{gid}:{user_id}:pet_offer:{t}")
-  kb.button(text="Cancel", callback_data=f"petmenu_cancel:{lobby_id}:{gid}:{user_id}")
-  kb.adjust(2, 2, 2, 1)
-  return kb.as_markup()
-
-
 def _kb_goto_page(lobby_id: str, gid: str, user_id: int, houses: int, page: int, current: int) -> Any:
   per_page = 10
   start = page * per_page + 1
@@ -226,6 +216,77 @@ def _kb_goto_page(lobby_id: str, gid: str, user_id: int, houses: int, page: int,
   kb.button(text="Close", callback_data=f"goto_close:{lobby_id}:{gid}:{user_id}")
   kb.adjust(5, 2, 1)
   return kb.as_markup()
+
+
+def _kb_pet_targets(lobby_id: str, gid: str, user_id: int, targets: list[str]) -> Any:
+  kb = InlineKeyboardBuilder()
+  for t in targets[:8]:
+    kb.button(text=f"Offer swap to {t}", callback_data=f"act:{lobby_id}:{gid}:{user_id}:pet_offer:{t}")
+  kb.button(text="Close", callback_data=f"petmenu_cancel:{lobby_id}:{gid}:{user_id}")
+  kb.adjust(2, 2, 2, 1)
+  return kb.as_markup()
+
+
+def _kb_actions_for_player(gid: str, lobby_id: str, user_id: int, ps: dict[str, Any]) -> Any:
+  kb = InlineKeyboardBuilder()
+
+  graph = str(ps.get("graph", "ring"))
+  left = int(ps.get("left_house", 1))
+  right = int(ps.get("right_house", 1))
+  in_trip = bool((ps.get("trip") or {}).get("active"))
+
+  offers_in = ps.get("pet_offers_in") or []
+  co_humans = ps.get("co_located_humans") or []
+
+  if in_trip:
+    kb.button(text="⏸ Wait (in trip)", callback_data=f"act:{lobby_id}:{gid}:{user_id}:stay")
+  else:
+    kb.button(text="⏸ Stay", callback_data=f"act:{lobby_id}:{gid}:{user_id}:stay")
+    if graph != "full":
+      kb.button(text=f"⬅ Left (to {left})", callback_data=f"act:{lobby_id}:{gid}:{user_id}:left")
+      kb.button(text=f"➡ Right (to {right})", callback_data=f"act:{lobby_id}:{gid}:{user_id}:right")
+    else:
+      kb.button(text="🏃 Choose destination", callback_data=f"goto:{lobby_id}:{gid}:{user_id}:0")
+
+  if (not in_trip) and len(co_humans) > 0:
+    kb.button(text="🐾 Propose pet swap", callback_data=f"petmenu:{lobby_id}:{gid}:{user_id}")
+
+  for offerer in offers_in[:4]:
+    kb.button(text=f"✅ Accept from {offerer}", callback_data=f"act:{lobby_id}:{gid}:{user_id}:pet_accept:{offerer}")
+    kb.button(text=f"❌ Decline {offerer}", callback_data=f"act:{lobby_id}:{gid}:{user_id}:pet_decline:{offerer}")
+
+  kb.button(text="🛑 End game", callback_data=f"end:{lobby_id}:{gid}:{user_id}")
+  kb.adjust(2, 2, 2)
+  return kb.as_markup()
+
+
+async def _send_private_or_scene(lobby: dict[str, Any], user_id: int, text: str, reply_markup: Any = None) -> None:
+  try:
+    await BOT.send_message(user_id, text, reply_markup=reply_markup)
+    return
+  except Exception:
+    pass
+
+  scene_chat_id = int(lobby["scene_chat_id"])
+  players = lobby.get("players", {})
+  p = players.get(str(user_id), {})
+  await BOT.send_message(scene_chat_id, f"{_mention(p)}\n\n{text}", reply_markup=reply_markup)
+
+
+async def _try_edit_lobby_message(lobby: dict[str, Any]) -> None:
+  chat_id = lobby.get("scene_chat_id")
+  msg_id = lobby.get("scene_message_id")
+  if not chat_id or not msg_id:
+    return
+  try:
+    await BOT.edit_message_text(
+      chat_id=int(chat_id),
+      message_id=int(msg_id),
+      text=_format_lobby(lobby),
+      reply_markup=_kb_lobby(lobby["id"]),
+    )
+  except Exception:
+    pass
 
 
 def _api_create_game(cfg: dict[str, Any]) -> str:
@@ -266,77 +327,47 @@ def _api_finish(gid: str) -> dict[str, Any]:
 
 
 def _render_player_info(ps: dict[str, Any]) -> str:
-  if not ps.get("ok"):
-    return f"Ошибка: {ps.get('reason')}"
+  if not ps.get("ok", True):
+    return f"Ошибка: {ps.get('reason', 'unknown')}"
 
-  role = ps["role"]
-  day = ps["day"]
-  days_total = ps["days_total"]
-  home = ps["home"]
-  loc = ps["location"]
+  role = ps.get("role", "?")
+  day = ps.get("day", "?")
+  days_total = ps.get("days_total", "?")
+  home = ps.get("home", "?")
+  loc = ps.get("location", "?")
+
   m1 = float(ps.get("m1", 0.0))
+  graph = str(ps.get("graph", "ring"))
 
   trip = ps.get("trip") or {}
   in_trip = bool(trip.get("active"))
 
   co_all = ps.get("co_located_all") or []
+  visitors = ps.get("visitors_today") or []
   offers = ps.get("pet_offers_in") or []
 
   lines: list[str] = []
   lines.append(f"🗓 День {day}/{days_total}")
-  lines.append(f"Вы: {role}. Ваш дом: {home}. Сейчас: дом {loc}.")
+  lines.append(f"Вы: {role}. Ваш дом: {home}. Сейчас: дом {loc}. Граф: {graph}.")
   lines.append(f"Ваши атрибуты: pet={ps.get('pet')} drink={ps.get('drink')} smoke={ps.get('smoke')}")
   if in_trip:
     lines.append(f"Вы в пути: {trip.get('src')} -> {trip.get('dst')} (осталось {trip.get('remaining')} дн.)")
   if co_all:
     lines.append("В вашем доме сейчас: " + ", ".join(co_all))
+  if visitors:
+    lines.append("К вам сегодня приходили: " + ", ".join(visitors))
   if offers:
     lines.append("Входящие предложения обмена питомцами: " + ", ".join(offers))
   lines.append(f"M1 сейчас: {m1:.3f}")
+
+  knowledge = ps.get("knowledge_by_house")
+  if isinstance(knowledge, list) and knowledge:
+    lines.append("")
+    lines.append("Ваши знания по домам:")
+    for row in knowledge[:50]:
+      lines.append(str(row))
+
   return "\n".join(lines)
-
-
-def _get_lobby(state: dict[str, Any], lobby_id: str) -> Optional[dict[str, Any]]:
-  _ensure(state)
-  return state["lobbies"].get(str(lobby_id))
-
-
-def _set_lobby(state: dict[str, Any], lobby_id: str, lobby: Optional[dict[str, Any]]) -> None:
-  _ensure(state)
-  if lobby is None:
-    state["lobbies"].pop(str(lobby_id), None)
-  else:
-    state["lobbies"][str(lobby_id)] = lobby
-
-
-def _user_lobby_id(state: dict[str, Any], user_id: int) -> Optional[str]:
-  _ensure(state)
-  return state["user_to_lobby"].get(str(int(user_id)))
-
-
-def _set_user_lobby(state: dict[str, Any], user_id: int, lobby_id: Optional[str]) -> None:
-  _ensure(state)
-  key = str(int(user_id))
-  if lobby_id is None:
-    state["user_to_lobby"].pop(key, None)
-  else:
-    state["user_to_lobby"][key] = str(lobby_id)
-
-
-async def _try_edit_lobby_message(lobby: dict[str, Any]) -> None:
-  chat_id = lobby.get("host_chat_id")
-  msg_id = lobby.get("host_message_id")
-  if not chat_id or not msg_id:
-    return
-  try:
-    await BOT.edit_message_text(
-      chat_id=int(chat_id),
-      message_id=int(msg_id),
-      text=_format_lobby(lobby),
-      reply_markup=_kb_lobby(lobby["id"]),
-    )
-  except Exception:
-    pass
 
 
 async def _send_invites(state: dict[str, Any], lobby: dict[str, Any]) -> None:
@@ -359,23 +390,19 @@ async def _send_invites(state: dict[str, Any], lobby: dict[str, Any]) -> None:
     try:
       await BOT.send_message(
         uid,
-        f"🎮 Вас пригласили в игру ZEBRA.\nХост: {host_text}\nКод комнаты: {lobby['id']}\n\nНажмите принять, чтобы присоединиться.",
+        f"🎮 Вас пригласили в ZEBRA.\nХост: {host_text}\nКод комнаты: {lobby['id']}\n\nНажмите принять, чтобы присоединиться.",
         reply_markup=_kb_invite(lobby["id"]),
       )
     except Exception:
       failed.append(f"@{uname}")
 
   if failed:
-    # хосту сообщаем, кого не смогли пригласить в личку
-    try:
-      await BOT.send_message(
-        int(lobby["host_chat_id"]),
-        "Не смог отправить приглашение в личку: " + " ".join(failed) + "\n"
-        "Причины: пользователь не писал боту после обновления или запретил сообщения.\n"
-        "Пусть они напишут боту /start один раз.",
-      )
-    except Exception:
-      pass
+    scene_chat_id = int(lobby["scene_chat_id"])
+    await BOT.send_message(
+      scene_chat_id,
+      "Не смог отправить приглашение в личку: " + " ".join(failed) + "\n"
+      "Пусть они напишут боту /start (в личке) один раз, и приглашения начнут приходить.",
+    )
 
 
 async def _finish_game_now(lobby_id: str, gid: str) -> None:
@@ -383,6 +410,9 @@ async def _finish_game_now(lobby_id: str, gid: str) -> None:
   lobby = _get_lobby(state, lobby_id)
   if not lobby:
     return
+
+  scene_chat_id = int(lobby["scene_chat_id"])
+  humans = lobby.get("humans", {})
 
   try:
     res = _api_finish(gid)
@@ -394,15 +424,10 @@ async def _finish_game_now(lobby_id: str, gid: str) -> None:
     else:
       lines = ["🏁 Игра завершена. Топ M1:"]
 
-    for i, item in enumerate(lb[:6], start=1):
+    for i, item in enumerate(lb[:10], start):
       lines.append(f"{i}) {item[0]}: {float(item[1]):.3f}")
 
-    humans = lobby.get("humans", {})
-    for uid_str in humans.keys():
-      try:
-        await BOT.send_message(int(uid_str), "\n".join(lines))
-      except Exception:
-        pass
+    await BOT.send_message(scene_chat_id, "\n".join(lines))
 
     files = res.get("files") or {}
     if files:
@@ -411,15 +436,8 @@ async def _finish_game_now(lobby_id: str, gid: str) -> None:
       xml = Path(files["xml"])
       zip_path = LOGS_DIR / f"game_{gid}.zip"
       _zip_files(zip_path, [metrics, events, xml])
-
-      for uid_str in humans.keys():
-        try:
-          await BOT.send_document(int(uid_str), FSInputFile(str(zip_path)))
-        except Exception:
-          pass
+      await BOT.send_document(scene_chat_id, FSInputFile(str(zip_path)))
   finally:
-    # чистим
-    humans = lobby.get("humans", {})
     for uid_str in humans.keys():
       _set_user_lobby(state, int(uid_str), None)
     _set_lobby(state, lobby_id, None)
@@ -440,13 +458,13 @@ async def _request_finish(lobby_id: str, requester_id: int) -> None:
   human_count = len(humans)
 
   if human_count <= 1:
-    await BOT.send_message(int(requester_id), "Живой игрок один - завершаю игру.")
+    await BOT.send_message(int(lobby["scene_chat_id"]), "Живой игрок один - завершаю игру.")
     await _finish_game_now(lobby_id, gid)
     return
 
   vote = lobby.get("end_vote")
   if vote and vote.get("active"):
-    await BOT.send_message(int(requester_id), "Голосование уже идет.")
+    await _send_private_or_scene(lobby, requester_id, "Голосование уже идет.")
     return
 
   lobby["end_vote"] = {
@@ -461,15 +479,13 @@ async def _request_finish(lobby_id: str, requester_id: int) -> None:
   _save_state(state)
 
   need = (human_count // 2) + 1
+  await BOT.send_message(
+    int(lobby["scene_chat_id"]),
+    f"🗳 Голосование за завершение игры. Нужно минимум {need} голосов 'Завершить'.",
+  )
+
   for uid_str in humans.keys():
-    try:
-      await BOT.send_message(
-        int(uid_str),
-        f"Голосование за завершение игры. Нужно минимум {need} голосов 'Завершить'.",
-        reply_markup=_kb_finish_vote(lobby_id),
-      )
-    except Exception:
-      pass
+    await _send_private_or_scene(lobby, int(uid_str), "Голосование: завершить игру?", reply_markup=_kb_finish_vote(lobby_id))
 
   asyncio.create_task(_vote_timer(lobby_id))
 
@@ -496,20 +512,10 @@ async def _vote_timer(lobby_id: str) -> None:
   _save_state(state)
 
   if yes_cnt >= need:
-    humans = lobby.get("humans", {})
-    for uid_str in humans.keys():
-      try:
-        await BOT.send_message(int(uid_str), "Большинство за завершение - завершаю игру.")
-      except Exception:
-        pass
+    await BOT.send_message(int(lobby["scene_chat_id"]), "🛑 Большинство за завершение - завершаю игру.")
     await _finish_game_now(lobby_id, lobby["server_game_id"])
   else:
-    humans = lobby.get("humans", {})
-    for uid_str in humans.keys():
-      try:
-        await BOT.send_message(int(uid_str), "Большинство не набрано - продолжаем игру.")
-      except Exception:
-        pass
+    await BOT.send_message(int(lobby["scene_chat_id"]), "✅ Большинства нет - продолжаем игру.")
 
 
 async def _send_turn_prompts(lobby_id: str) -> None:
@@ -526,7 +532,35 @@ async def _send_turn_prompts(lobby_id: str) -> None:
     uid = int(uid_str)
     ps = _api_player_state(gid, uid)
     txt = _render_player_info(ps)
-    await BOT.send_message(uid, txt, reply_markup=_kb_actions_for_player(gid, lobby_id, uid, ps))
+    await _send_private_or_scene(lobby, uid, txt, reply_markup=_kb_actions_for_player(gid, lobby_id, uid, ps))
+
+
+def _public_day_summary_from_state(st: dict[str, Any]) -> Optional[str]:
+  # пробуем вытащить публичную расстановку из state, если сервер ее дает
+  day = st.get("day")
+  days_total = st.get("days_total")
+  if "house_occupants" in st and isinstance(st["house_occupants"], dict):
+    by_house = st["house_occupants"]
+    lines = [f"📢 День {day}/{days_total} завершен. Расстановка:"]
+    for h in sorted(by_house.keys(), key=lambda x: int(x)):
+      who = by_house[h]
+      if isinstance(who, list) and who:
+        lines.append(f"Дом {h}: " + ", ".join([str(x) for x in who]))
+    return "\n".join(lines)
+
+  if "positions" in st and isinstance(st["positions"], dict):
+    pos = st["positions"]  # role -> house
+    by_house: dict[int, list[str]] = {}
+    for role, house in pos.items():
+      by_house.setdefault(int(house), []).append(str(role))
+    lines = [f"📢 День {day}/{days_total} завершен. Расстановка:"]
+    for h in sorted(by_house.keys()):
+      lines.append(f"Дом {h}: " + ", ".join(sorted(by_house[h])))
+    return "\n".join(lines)
+
+  if day is not None and days_total is not None:
+    return f"📢 День {day}/{days_total} завершен."
+  return None
 
 
 async def _do_step_and_next(lobby_id: str) -> None:
@@ -540,15 +574,24 @@ async def _do_step_and_next(lobby_id: str) -> None:
 
   res = _api_step(gid)
 
+  # Публичное повествование в сцену
+  scene_chat_id = int(lobby["scene_chat_id"])
+  st = _api_state(gid)
+  pub = res.get("public_story")
+  if isinstance(pub, list) and pub:
+    await BOT.send_message(scene_chat_id, "📜 " + "\n".join([str(x) for x in pub]))
+  else:
+    summary = _public_day_summary_from_state(st)
+    if summary:
+      await BOT.send_message(scene_chat_id, summary)
+
+  # Приватные отчеты каждому игроку (про "к вам пришли..." и т.д.)
   reports = res.get("reports") or {}
   humans = lobby.get("humans", {})
-
-  if res.get("day_finished") is not None:
-    for uid_str, role in humans.items():
-      uid = int(uid_str)
-      lines = reports.get(role, [])
-      if lines:
-        await BOT.send_message(uid, "✅ " + "\n".join(lines))
+  for uid_str, role in humans.items():
+    lines = reports.get(role)
+    if isinstance(lines, list) and lines:
+      await _send_private_or_scene(lobby, int(uid_str), "✅ Итоги дня:\n" + "\n".join([str(x) for x in lines]))
 
   if res.get("done"):
     await _finish_game_now(lobby_id, gid)
@@ -571,11 +614,8 @@ async def _turn_timer(lobby_id: str) -> None:
       return
 
     st = _api_state(gid)
-    if int(st["day"]) > int(st["days_total"]):
-      return
-
     pending = st.get("pending_user_ids", [])
-    if len(pending) > 0:
+    if isinstance(pending, list) and len(pending) > 0:
       await _do_step_and_next(lobby_id)
 
 
@@ -596,8 +636,8 @@ async def _start_game(lobby_id: str) -> None:
 
   players: dict[str, dict[str, Any]] = lobby.get("players", {})
   need = int(lobby["settings"]["players"])
-  users_sorted = list(players.keys())[:need]
 
+  users_sorted = list(players.keys())[:need]
   humans_payload = []
   humans_map: dict[str, str] = {}
 
@@ -626,24 +666,20 @@ async def _start_game(lobby_id: str) -> None:
   lobby["end_vote"] = None
 
   _set_lobby(state, lobby_id, lobby)
-
   for uid_str in humans_map.keys():
     _set_user_lobby(state, int(uid_str), lobby_id)
-
   _save_state(state)
 
-  # всем в личку
+  scene_chat_id = int(lobby["scene_chat_id"])
   lines = ["🎮 Игра началась. Роли людей:"]
   for uid_str, role in humans_map.items():
     lines.append(f"- {_mention(players[uid_str])} -> {role}")
+  lines.append(f"Server game_id: {gid}")
   msg = "\n".join(lines)
 
-  for uid_str in humans_map.keys():
-    try:
-      await BOT.send_message(int(uid_str), msg)
-    except Exception:
-      pass
+  await BOT.send_message(scene_chat_id, msg)
 
+  # первые приватные ходы
   await _send_turn_prompts(lobby_id)
   asyncio.create_task(_turn_timer(lobby_id))
 
@@ -653,50 +689,7 @@ async def cmd_start(m: Message) -> None:
   state = _load_state()
   _register_user(state, m.from_user)
   _save_state(state)
-  await m.answer("Ок. Теперь я могу приглашать тебя в игры в личку.\nКоманды: /game @user ... , /join CODE , /end")
-
-
-@router.message(Command("join"))
-async def cmd_join(m: Message) -> None:
-  parts = (m.text or "").split()
-  if len(parts) < 2:
-    await m.answer("Формат: /join CODE")
-    return
-  code = parts[1].strip()
-
-  state = _load_state()
-  _register_user(state, m.from_user)
-
-  lobby = _get_lobby(state, code)
-  if not lobby or lobby.get("stage") != "lobby":
-    await m.answer("Комната не найдена или уже запущена.")
-    _save_state(state)
-    return
-
-  invited = lobby.get("invited_usernames") or []
-  uname = (m.from_user.username or "").lower()
-  is_invited = (not invited) or (uname in invited) or (int(m.from_user.id) == int(lobby["host_id"]))
-
-  if not is_invited:
-    await m.answer("Ты не в списке приглашенных.")
-    _save_state(state)
-    return
-
-  players = lobby.setdefault("players", {})
-  need = int(lobby["settings"]["players"])
-  uid_str = str(m.from_user.id)
-  if uid_str not in players:
-    if len(players) >= need:
-      await m.answer("Нет мест.")
-      _save_state(state)
-      return
-    players[uid_str] = {"name": m.from_user.full_name or "user", "username": m.from_user.username or None}
-
-  _set_lobby(state, code, lobby)
-  _save_state(state)
-
-  await m.answer("Вы присоединились к лобби. Ждите старта.")
-  await _try_edit_lobby_message(lobby)
+  await m.answer("Ок. Теперь я могу отправлять тебе приватные ходы и приглашения.\nКоманды: /game @user ... , /end")
 
 
 @router.message(Command("game"))
@@ -711,6 +704,8 @@ async def cmd_game(m: Message) -> None:
     if t.startswith("@") and len(t) > 1:
       invited_usernames.append(t[1:].lower())
 
+  invited_usernames = list(dict.fromkeys(invited_usernames))
+
   lobby_id = str(int(time.time()))
   settings = asdict(DEFAULTS)
 
@@ -722,8 +717,8 @@ async def cmd_game(m: Message) -> None:
   lobby = {
     "id": lobby_id,
     "host_id": int(m.from_user.id),
-    "host_chat_id": int(m.chat.id),
-    "host_message_id": None,
+    "scene_chat_id": int(m.chat.id),
+    "scene_message_id": None,
     "created_at": time.time(),
     "deadline_at": time.time() + int(settings["lobby_delay_sec"]),
     "stage": "lobby",
@@ -738,12 +733,13 @@ async def cmd_game(m: Message) -> None:
   _save_state(state)
 
   msg = await m.answer(_format_lobby(lobby), reply_markup=_kb_lobby(lobby_id))
-  lobby["host_message_id"] = int(msg.message_id)
+  lobby["scene_message_id"] = int(msg.message_id)
+
   _set_lobby(state, lobby_id, lobby)
   _save_state(state)
 
   if invited_usernames:
-    await m.answer("Пытаюсь отправить приглашения в личку...")
+    await m.answer("Пытаюсь отправить приглашения в личку (если бот знает user_id и у людей открыт /start).")
     await _send_invites(state, lobby)
 
   asyncio.create_task(_auto_start_lobby(lobby_id, int(settings["lobby_delay_sec"]) + 1))
@@ -755,6 +751,7 @@ async def cmd_end(m: Message) -> None:
   _register_user(state, m.from_user)
   lobby_id = _user_lobby_id(state, m.from_user.id)
   _save_state(state)
+
   if not lobby_id:
     await m.answer("Ты сейчас не в игре.")
     return
@@ -792,17 +789,12 @@ async def on_cb(q: CallbackQuery) -> None:
 
     if act == "decline":
       await q.answer("Ок")
-      try:
-        await BOT.send_message(int(lobby["host_chat_id"]), f"{q.from_user.username or q.from_user.full_name} отклонил приглашение.")
-      except Exception:
-        pass
+      await BOT.send_message(int(lobby["scene_chat_id"]), f"{q.from_user.username or q.from_user.full_name} отклонил приглашение.")
       return
 
-    # accept
     players = lobby.setdefault("players", {})
     need = int(lobby["settings"]["players"])
     uid_str = str(q.from_user.id)
-
     if uid_str not in players:
       if len(players) >= need:
         await q.answer("Нет мест")
@@ -813,7 +805,7 @@ async def on_cb(q: CallbackQuery) -> None:
     _save_state(state)
 
     await q.answer("Вы в лобби")
-    await BOT.send_message(q.from_user.id, f"Вы присоединились к лобби. Код: {lobby_id}. Ждите старта.")
+    await BOT.send_message(int(lobby["scene_chat_id"]), f"{q.from_user.username or q.from_user.full_name} присоединился к лобби.")
     await _try_edit_lobby_message(lobby)
     return
 
@@ -883,7 +875,6 @@ async def on_cb(q: CallbackQuery) -> None:
       if uid != host_id:
         await q.answer("Только хост")
         return
-      # очистка
       players = lobby.get("players", {})
       for uid_str in players.keys():
         _set_user_lobby(state, int(uid_str), None)
@@ -891,13 +882,12 @@ async def on_cb(q: CallbackQuery) -> None:
       _save_state(state)
       await q.answer("Ок")
       try:
-        await BOT.edit_message_text(chat_id=int(lobby["host_chat_id"]), message_id=int(lobby["host_message_id"]), text="Игра отменена.")
+        await BOT.edit_message_text(chat_id=int(lobby["scene_chat_id"]), message_id=int(lobby["scene_message_id"]), text="Игра отменена.")
       except Exception:
         pass
       return
 
   if data.startswith("end:"):
-    # end:{lobby_id}:{gid}:{uid}
     parts = data.split(":")
     if len(parts) != 4:
       await q.answer()
@@ -962,6 +952,7 @@ async def on_cb(q: CallbackQuery) -> None:
       _set_lobby(state, lobby_id, lobby)
       _save_state(state)
       await q.answer("Большинство набрано")
+      await BOT.send_message(int(lobby["scene_chat_id"]), "🛑 Большинство набрано. Завершаю игру.")
       await _finish_game_now(lobby_id, lobby["server_game_id"])
       return
 
@@ -969,7 +960,6 @@ async def on_cb(q: CallbackQuery) -> None:
     return
 
   if data.startswith("goto:"):
-    # goto:{lobby_id}:{gid}:{uid}:{page}
     parts = data.split(":")
     if len(parts) != 5:
       await q.answer()
@@ -988,12 +978,11 @@ async def on_cb(q: CallbackQuery) -> None:
     ps = _api_player_state(gid, uid)
     houses = int(lobby["settings"]["houses"])
     cur = int(ps.get("location", 1))
-    await BOT.send_message(uid, f"Выбор дома (стр {page})", reply_markup=_kb_goto_page(lobby_id, gid, uid, houses, page, cur))
+    await _send_private_or_scene(lobby, uid, f"Выбор дома (стр {page})", reply_markup=_kb_goto_page(lobby_id, gid, uid, houses, page, cur))
     await q.answer("Ок")
     return
 
   if data.startswith("petmenu:"):
-    # petmenu:{lobby_id}:{gid}:{uid}
     parts = data.split(":")
     if len(parts) != 4:
       await q.answer()
@@ -1002,17 +991,24 @@ async def on_cb(q: CallbackQuery) -> None:
     if int(q.from_user.id) != uid:
       await q.answer("Это не твоя кнопка")
       return
+
+    state = _load_state()
+    lobby = _get_lobby(state, lobby_id)
+    if not lobby or lobby.get("stage") != "running":
+      await q.answer("Игра не активна")
+      return
+
     ps = _api_player_state(gid, uid)
     targets = ps.get("co_located_humans") or []
     if not targets:
       await q.answer("Нет живых игроков рядом")
       return
-    await BOT.send_message(uid, "С кем обменяться питомцами? (нужно согласие второго игрока)", reply_markup=_kb_pet_targets(lobby_id, gid, uid, targets))
+
+    await _send_private_or_scene(lobby, uid, "С кем обменяться питомцами? (нужно согласие второго игрока)", reply_markup=_kb_pet_targets(lobby_id, gid, uid, targets))
     await q.answer("Ок")
     return
 
   if data.startswith("act:"):
-    # act:{lobby_id}:{gid}:{uid}:{kind} либо act:{lobby_id}:{gid}:{uid}:{kind}:{arg}
     parts = data.split(":")
     if len(parts) not in (5, 6):
       await q.answer()
@@ -1036,29 +1032,49 @@ async def on_cb(q: CallbackQuery) -> None:
       return
 
     try:
+      # действие
       if kind == "go_to":
         dst = int(arg) if arg else None
         _api_action(gid, uid, "go_to", dst=dst)
+        await _send_private_or_scene(lobby, uid, f"Вы выбрали: идти в дом {dst}.")
       elif kind in ("stay", "left", "right"):
         _api_action(gid, uid, kind)
+        if kind == "left":
+          ps = _api_player_state(gid, uid)
+          await _send_private_or_scene(lobby, uid, f"Вы выбрали: налево (в дом {ps.get('left_house')}).")
+        elif kind == "right":
+          ps = _api_player_state(gid, uid)
+          await _send_private_or_scene(lobby, uid, f"Вы выбрали: направо (в дом {ps.get('right_house')}).")
+        else:
+          await _send_private_or_scene(lobby, uid, "Вы выбрали: остаться.")
       elif kind == "pet_offer":
         _api_action(gid, uid, "pet_offer", target=arg)
+        await _send_private_or_scene(lobby, uid, f"Вы предложили обмен питомцами игроку {arg}.")
       elif kind == "pet_accept":
         _api_action(gid, uid, "pet_accept", target=arg)
+        await _send_private_or_scene(lobby, uid, f"Вы приняли обмен питомцами от {arg}.")
       elif kind == "pet_decline":
         _api_action(gid, uid, "pet_decline", target=arg)
+        await _send_private_or_scene(lobby, uid, f"Вы отказали в обмене питомцами от {arg}.")
       else:
         await q.answer("Неизвестное действие")
         return
 
       await q.answer("Ход принят")
 
+      # если все сделали ход - шагаем день
       st = _api_state(gid)
-      if len(st.get("pending_user_ids", [])) == 0:
+      pending = st.get("pending_user_ids", [])
+      if isinstance(pending, list) and len(pending) == 0:
         await _do_step_and_next(lobby_id)
+      else:
+        # обновим приватку игроку (кнопки могут измениться)
+        ps = _api_player_state(gid, uid)
+        await _send_private_or_scene(lobby, uid, _render_player_info(ps), reply_markup=_kb_actions_for_player(gid, lobby_id, uid, ps))
+
     except Exception as e:
       await q.answer("Ошибка")
-      await BOT.send_message(uid, f"Ошибка action: {e}")
+      await _send_private_or_scene(lobby, uid, f"Ошибка action: {e}")
     return
 
   await q.answer()
