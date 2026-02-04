@@ -350,8 +350,14 @@ class InteractiveGame:
   def state(self) -> dict[str, Any]:
     by_home = self._by_home()
     m1s = {a.name: _m1(a, self.houses, by_home) for a in self.agents}
-    pending_humans = []
+    # Важно: если человек в пути, от него не требуется действие на этот день.
+    # Иначе игра может "зависнуть" в ожидании хода от игрока, который физически не может ходить.
+    by_name = self._by_name()
+    pending_humans: list[int] = []
     for uid, name in self.humans.items():
+      a = by_name.get(name)
+      if a is not None and a.trip.active:
+        continue
       if name not in self.pending_actions:
         pending_humans.append(uid)
     return {
