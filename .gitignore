@@ -9,6 +9,6 @@ data/logs/*
 
 *.zip
 *.tgz
-
+*.gitignore
 submission_prog/
 submission_prog_final/
