@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 import zipfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from aiogram import Bot
 from aiogram.types import FSInputFile
@@ -17,30 +18,29 @@ from zebra_bot.keyboards import (
   kb_goto_page,
   kb_lobby,
   kb_pet_offer_answer,
-  kb_pet_targets,
 )
 from zebra_bot.render import agent_names, format_lobby, render_player_info
 from zebra_bot.storage import (
   get_game,
-  set_game,
   load_state,
-  save_state,
   mention,
+  save_state,
+  set_game,
   user_id_by_username,
 )
 
 
 def _zip_files(zip_path: Path, paths: list[Path]) -> None:
-  zip_path.parent.mkdir(parents=True, exist_ok=True)
-  with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-    for p in paths:
-      if p.exists():
-        zf.write(p, arcname=p.name)
+  zip_path.parent.mkdir(parents = True, exist_ok = True)
+  with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
+    for path in paths:
+      if path.exists():
+        archive.write(path, arcname = path.name)
 
 
 async def _send_dm(bot: Bot, uid: int, text: str, reply_markup: Any | None = None) -> bool:
   try:
-    await bot.send_message(uid, text, reply_markup=reply_markup)
+    await bot.send_message(uid, text, reply_markup = reply_markup)
     return True
   except Exception:
     return False
@@ -51,21 +51,25 @@ async def sync_lobby_message(bot: Bot, lobby_chat_id: int, force_text: str | Non
   game = get_game(state, lobby_chat_id)
   if not game:
     return
-  msg_id = game.get("lobby_message_id")
-  if not msg_id:
+
+  message_id = game.get("lobby_message_id")
+  if not message_id:
     return
+
   text = force_text or format_lobby(game)
+  reply_markup = kb_lobby(lobby_chat_id, game["id"]) if game.get("stage") == "lobby" else None
+
   try:
     await bot.edit_message_text(
       text,
-      chat_id=lobby_chat_id,
-      message_id=int(msg_id),
-      reply_markup=kb_lobby(lobby_chat_id, game["id"]),
+      chat_id = lobby_chat_id,
+      message_id = int(message_id),
+      reply_markup = reply_markup,
     )
   except Exception:
     try:
-      msg = await bot.send_message(lobby_chat_id, text, reply_markup=kb_lobby(lobby_chat_id, game["id"]))
-      game["lobby_message_id"] = msg.message_id
+      message = await bot.send_message(lobby_chat_id, text, reply_markup = reply_markup)
+      game["lobby_message_id"] = message.message_id
       set_game(state, lobby_chat_id, game)
       save_state(state)
     except Exception:
@@ -74,60 +78,64 @@ async def sync_lobby_message(bot: Bot, lobby_chat_id: int, force_text: str | Non
 
 async def create_lobby(bot: Bot, lobby_chat_id: int, host_user: Any, invited_usernames: list[str]) -> None:
   state = load_state()
-
-  if get_game(state, lobby_chat_id) is not None:
-    await bot.send_message(lobby_chat_id, "В этом чате уже есть активная игра. Отмени кнопкой Cancel.")
+  existing = get_game(state, lobby_chat_id)
+  if existing is not None:
+    if existing.get("stage") == "lobby":
+      await bot.send_message(
+        lobby_chat_id,
+        "В этом чате уже есть лобби. Его может отменить только хост кнопкой Cancel в сообщении лобби.",
+      )
+    else:
+      await bot.send_message(lobby_chat_id, "В этом чате уже идет игра. Сначала заверши текущую сессию.")
     return
 
   lobby_id = str(int(time.time()))
   settings = defaults_dict()
 
-  host_payload = {
-    "name": host_user.full_name or "host",
-    "username": (host_user.username or "").lower() or None,
-  }
-
   game = {
     "id": lobby_id,
     "chat_id": lobby_chat_id,
     "host_id": int(host_user.id),
-    "created_at": time.time(),
+    "created_at": int(time.time()),
     "deadline_at": time.time() + int(settings["lobby_delay_sec"]),
     "stage": "lobby",
     "settings": settings,
     "invited_usernames": invited_usernames,
     "players": {
-      str(host_user.id): host_payload,
+      str(host_user.id): {
+        "name": host_user.full_name or "host",
+        "username": (host_user.username or "").lower() or None,
+      },
     },
   }
 
   set_game(state, lobby_chat_id, game)
   save_state(state)
 
-  msg = await bot.send_message(lobby_chat_id, format_lobby(game), reply_markup=kb_lobby(lobby_chat_id, lobby_id))
+  message = await bot.send_message(lobby_chat_id, format_lobby(game), reply_markup = kb_lobby(lobby_chat_id, lobby_id))
   state = load_state()
   game = get_game(state, lobby_chat_id) or game
-  game["lobby_message_id"] = msg.message_id
+  game["lobby_message_id"] = message.message_id
   set_game(state, lobby_chat_id, game)
   save_state(state)
 
   if invited_usernames:
-    not_known: list[str] = []
-    for u in invited_usernames:
-      uid = user_id_by_username(state, u)
+    unknown: list[str] = []
+    for username in invited_usernames:
+      uid = user_id_by_username(state, username)
       if uid is None:
-        not_known.append(u)
+        unknown.append(username)
         continue
       await _send_dm(
         bot,
         uid,
         f"🎮 Тебя пригласили в игру ZEBRA.\nЛобби в чате {lobby_chat_id}.\nНажми Join.",
-        reply_markup=kb_lobby(lobby_chat_id, lobby_id),
+        reply_markup = kb_lobby(lobby_chat_id, lobby_id),
       )
-    if not_known:
+    if unknown:
       await bot.send_message(
         lobby_chat_id,
-        "Не смог отправить приглашение (они не нажимали /start боту): " + " ".join(f"@{x}" for x in not_known),
+        "Не смог отправить приглашение (эти пользователи не нажимали /start боту): " + " ".join(f"@{x}" for x in unknown),
       )
 
   asyncio.create_task(_auto_start_lobby(bot, lobby_chat_id, lobby_id, int(settings["lobby_delay_sec"]) + 1))
@@ -151,16 +159,23 @@ async def start_game(bot: Bot, lobby_chat_id: int) -> None:
   players = list((game.get("players") or {}).items())
   need = int(game["settings"]["players"])
   houses = int(game["settings"]["houses"])
+
   roles = agent_names(need, houses)
+  rng = random.Random(int(game.get("created_at", time.time())))
+  rng.shuffle(roles)
 
   humans = players[:need]
   humans_payload: list[dict[str, Any]] = []
   humans_map: dict[str, str] = {}
   role_to_uid: dict[str, str] = {}
 
-  for i, (uid_str, p) in enumerate(humans):
-    role = roles[i]
-    humans_payload.append({"user_id": int(uid_str), "name": p.get("name", "user"), "role": role})
+  for index, (uid_str, payload) in enumerate(humans):
+    role = roles[index]
+    humans_payload.append({
+      "user_id": int(uid_str),
+      "name": payload.get("name", "user"),
+      "role": role,
+    })
     humans_map[str(uid_str)] = role
     role_to_uid[role] = str(uid_str)
 
@@ -187,6 +202,13 @@ async def start_game(bot: Bot, lobby_chat_id: int) -> None:
   set_game(state, lobby_chat_id, game)
   save_state(state)
 
+  message_id = game.get("lobby_message_id")
+  if message_id:
+    try:
+      await bot.edit_message_reply_markup(chat_id = lobby_chat_id, message_id = int(message_id), reply_markup = None)
+    except Exception:
+      pass
+
   lines = ["🎮 Игра началась. Роли людей:"]
   for uid_str, role in humans_map.items():
     lines.append(f"- {mention(game['players'][uid_str])} -> {role}")
@@ -194,12 +216,15 @@ async def start_game(bot: Bot, lobby_chat_id: int) -> None:
   lines.append("Ходы и приватные сообщения приходят в личку.")
   await bot.send_message(lobby_chat_id, "\n".join(lines))
 
-  for uid_str in humans_map.keys():
+  for uid_str in humans_map:
     uid = int(uid_str)
-    ok = await send_private_turn_state(bot, lobby_chat_id, uid)
-    if not ok:
-      p = game["players"].get(uid_str, {"name": "user"})
-      await bot.send_message(lobby_chat_id, f"⚠ Не смог написать в личку {mention(p)}. Пусть он откроет бота и нажмет /start.")
+    sent = await send_private_turn_state(bot, lobby_chat_id, uid)
+    if not sent:
+      player = game["players"].get(uid_str, {"name": "user"})
+      await bot.send_message(
+        lobby_chat_id,
+        f"⚠ Не смог написать в личку {mention(player)}. Пусть он откроет бота и нажмет /start.",
+      )
 
   await send_group_waiting(bot, lobby_chat_id)
   asyncio.create_task(turn_timer(bot, lobby_chat_id))
@@ -210,10 +235,11 @@ async def send_private_turn_state(bot: Bot, lobby_chat_id: int, uid: int) -> boo
   game = get_game(state, lobby_chat_id)
   if not game or game.get("stage") != "running":
     return False
+
   gid = str(game.get("server_game_id"))
-  ps = api.player_state(gid, uid)
-  text = render_player_info(ps)
-  return await _send_dm(bot, uid, text, reply_markup=kb_actions_for_player(lobby_chat_id, uid, ps))
+  player_state = api.player_state(gid, uid)
+  text = render_player_info(player_state)
+  return await _send_dm(bot, uid, text, reply_markup = kb_actions_for_player(lobby_chat_id, uid, player_state))
 
 
 async def send_group_waiting(bot: Bot, lobby_chat_id: int) -> None:
@@ -221,16 +247,18 @@ async def send_group_waiting(bot: Bot, lobby_chat_id: int) -> None:
   game = get_game(state, lobby_chat_id)
   if not game or game.get("stage") != "running":
     return
+
   gid = str(game.get("server_game_id"))
-  st = api.state(gid)
-  pending = st.get("pending_user_ids", [])
+  current_state = api.state(gid)
+  pending = current_state.get("pending_user_ids", [])
   if not pending:
-    await bot.send_message(lobby_chat_id, "⏳ Сейчас никто не должен ходить (все в пути/все походили).")
+    await bot.send_message(lobby_chat_id, "⏳ Сейчас никто не должен ходить.")
     return
+
   names: list[str] = []
   for uid in pending:
-    p = game.get("players", {}).get(str(uid))
-    names.append(mention(p) if p else str(uid))
+    player = game.get("players", {}).get(str(uid))
+    names.append(mention(player) if player else str(uid))
   await bot.send_message(lobby_chat_id, "⏳ Ожидаю ходы от: " + ", ".join(names))
 
 
@@ -244,15 +272,15 @@ async def turn_timer(bot: Bot, lobby_chat_id: int) -> None:
       return
 
     gid = str(game.get("server_game_id"))
-    st = api.state(gid)
-    pending = st.get("pending_user_ids", [])
+    current_state = api.state(gid)
+    pending = current_state.get("pending_user_ids", [])
 
     any_trip = False
     for uid_str in (game.get("humans") or {}).keys():
       uid = int(uid_str)
-      ps = api.player_state(gid, uid)
-      trip = (ps.get("trip") or {})
-      if ps.get("ok") and bool(trip.get("active")):
+      player_state = api.player_state(gid, uid)
+      trip = player_state.get("trip") or {}
+      if player_state.get("ok") and bool(trip.get("active")):
         any_trip = True
         break
 
@@ -265,9 +293,10 @@ async def maybe_step_and_next(bot: Bot, lobby_chat_id: int) -> None:
   game = get_game(state, lobby_chat_id)
   if not game or game.get("stage") != "running":
     return
+
   gid = str(game.get("server_game_id"))
-  st = api.state(gid)
-  if len(st.get("pending_user_ids", [])) == 0:
+  current_state = api.state(gid)
+  if len(current_state.get("pending_user_ids", [])) == 0:
     await do_step_and_next(bot, lobby_chat_id)
   else:
     await send_group_waiting(bot, lobby_chat_id)
@@ -278,47 +307,46 @@ async def do_step_and_next(bot: Bot, lobby_chat_id: int) -> None:
   game = get_game(state, lobby_chat_id)
   if not game or game.get("stage") != "running":
     return
-  gid = str(game.get("server_game_id"))
 
-  res = api.step(gid)
-  day_finished = res.get("day_finished")
+  gid = str(game.get("server_game_id"))
+  result = api.step(gid)
+  day_finished = result.get("day_finished")
   if day_finished is not None:
     await bot.send_message(lobby_chat_id, f"✅ День {day_finished} завершен.")
 
-  reports = res.get("reports") or {}
+  reports = result.get("reports") or {}
   for uid_str, role in (game.get("humans") or {}).items():
     uid = int(uid_str)
     lines = reports.get(role, [])
     if lines:
       await _send_dm(bot, uid, "\n".join(lines))
 
-  if res.get("done"):
+  if result.get("done"):
     await finish_game_now(bot, lobby_chat_id, gid)
     return
 
   for uid_str in (game.get("humans") or {}).keys():
-    uid = int(uid_str)
-    await send_private_turn_state(bot, lobby_chat_id, uid)
+    await send_private_turn_state(bot, lobby_chat_id, int(uid_str))
 
   await send_group_waiting(bot, lobby_chat_id)
 
 
 async def finish_game_now(bot: Bot, lobby_chat_id: int, gid: str) -> None:
   try:
-    res = api.finish(gid)
+    result = api.finish(gid)
 
-    lb = res.get("leaderboard") or []
-    day_finished = res.get("day_finished")
+    lines: list[str] = []
+    day_finished = result.get("day_finished")
     if day_finished is not None:
-      lines = [f"🏁 Игра завершена на дне {day_finished}. Топ M1:"]
+      lines.append(f"🏁 Игра завершена на дне {day_finished}. Топ M1:")
     else:
-      lines = ["🏁 Игра завершена. Топ M1:"]
+      lines.append("🏁 Игра завершена. Топ M1:")
 
-    for i, item in enumerate(lb[:10], start=1):
-      lines.append(f"{i}) {item[0]}: {float(item[1]):.3f}")
+    for index, item in enumerate(result.get("leaderboard") or [], start = 1):
+      lines.append(f"{index}) {item[0]}: {float(item[1]):.3f}")
     await bot.send_message(lobby_chat_id, "\n".join(lines))
 
-    files = res.get("files") or {}
+    files = result.get("files") or {}
     if files:
       metrics = Path(files["metrics"])
       events = Path(files["csv"])
@@ -346,7 +374,6 @@ async def request_finish(bot: Bot, lobby_chat_id: int, requester_id: int) -> Non
 
   humans = game.get("humans", {})
   human_count = len(humans)
-
   if human_count <= 1:
     await bot.send_message(lobby_chat_id, "Живой игрок один - завершаю игру.")
     await finish_game_now(bot, lobby_chat_id, gid)
@@ -371,7 +398,7 @@ async def request_finish(bot: Bot, lobby_chat_id: int, requester_id: int) -> Non
   await bot.send_message(
     lobby_chat_id,
     f"Голосование за завершение игры. Нужно минимум {need} голосов 'Завершить'.",
-    reply_markup=kb_finish_vote(lobby_chat_id),
+    reply_markup = kb_finish_vote(lobby_chat_id),
   )
   asyncio.create_task(_vote_timer(bot, lobby_chat_id, gid))
 
@@ -388,7 +415,7 @@ async def _vote_timer(bot: Bot, lobby_chat_id: int, gid: str) -> None:
   if not vote.get("active"):
     return
 
-  yes_cnt = len(set(vote.get("yes", [])))
+  yes_count = len(set(vote.get("yes", [])))
   human_count = int(vote.get("human_count", 0))
   need = (human_count // 2) + 1
 
@@ -397,7 +424,7 @@ async def _vote_timer(bot: Bot, lobby_chat_id: int, gid: str) -> None:
   set_game(state, lobby_chat_id, game)
   save_state(state)
 
-  if yes_cnt >= need:
+  if yes_count >= need:
     await bot.send_message(lobby_chat_id, "Большинство за завершение - завершаю игру.")
     await finish_game_now(bot, lobby_chat_id, gid)
   else:
@@ -409,8 +436,8 @@ async def notify_pet_offer(bot: Bot, lobby_chat_id: int, offerer_uid: int, targe
   game = get_game(state, lobby_chat_id)
   if not game or game.get("stage") != "running":
     return
-  gid = str(game.get("server_game_id"))
 
+  gid = str(game.get("server_game_id"))
   offerer_role = (game.get("humans") or {}).get(str(offerer_uid))
   if not offerer_role:
     return
@@ -418,18 +445,18 @@ async def notify_pet_offer(bot: Bot, lobby_chat_id: int, offerer_uid: int, targe
   target_uid_str = (game.get("role_to_uid") or {}).get(target_role)
   if not target_uid_str:
     return
-  target_uid = int(target_uid_str)
 
+  target_uid = int(target_uid_str)
   await _send_dm(bot, offerer_uid, f"🐾 Предложение обмена отправлено игроку {target_role}. Ждем ответа.")
 
-  ps = api.player_state(gid, target_uid)
+  player_state = api.player_state(gid, target_uid)
   text = (
     "🐾 Вам предлагают обмен питомцами!\n"
     f"От: {offerer_role}\n\n"
     "Ваш текущий статус:\n"
-    f"{render_player_info(ps)}"
+    f"{render_player_info(player_state)}"
   )
-  sent = await _send_dm(bot, target_uid, text, reply_markup=kb_pet_offer_answer(lobby_chat_id, target_uid, offerer_role))
+  sent = await _send_dm(bot, target_uid, text, reply_markup = kb_pet_offer_answer(lobby_chat_id, target_uid, offerer_role))
   if not sent:
     await bot.send_message(lobby_chat_id, f"🐾 Игроку {target_role} предложили обмен от {offerer_role}, но личка недоступна.")
 
@@ -443,8 +470,8 @@ async def notify_pet_answer(bot: Bot, lobby_chat_id: int, target_uid: int, offer
   offerer_uid_str = (game.get("role_to_uid") or {}).get(offerer_role)
   if not offerer_uid_str:
     return
-  offerer_uid = int(offerer_uid_str)
 
+  offerer_uid = int(offerer_uid_str)
   target_role = (game.get("humans") or {}).get(str(target_uid), "")
   if accepted:
     await _send_dm(bot, offerer_uid, f"🐾 Игрок {target_role} принял обмен. Обмен произойдет при завершении дня.")
