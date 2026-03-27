@@ -1,110 +1,55 @@
-import requests
-import csv
+from __future__ import annotations
+
+import argparse
+import json
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Any
 
-from strategy.types import PlayerState, BeliefState, Action
-from strategy.base_strategy import decide_action
-from strategy.metrics import calc_sa
+from simulator.engine import run_session
 
 
-BASE_URL = "http://127.0.0.1:8000"
-
-def get_log() -> List[Dict[str, Any]]:
-  resp = requests.get(f"{BASE_URL}/log")
-  resp.raise_for_status()
-  data: List[Dict[str, Any]] = resp.json()
-  return data
-
-def save_log_csv(events: List[Dict[str, Any]], filename: str = "data/logs/run1.csv") -> None:
-  path = Path(filename)
-  path.parent.mkdir(parents = True, exist_ok = True)
-
-  fieldnames = ["event_id", "day", "type", "who", "from_house", "to_house", "success"]
-
-  with path.open("w", newline = "") as f:
-    writer = csv.DictWriter(f, fieldnames = fieldnames)
-    writer.writeheader()
-    for e in events:
-      row = {name: e.get(name) for name in fieldnames}
-      writer.writerow(row)
-
-  print(f"log saved to {path}")
+DEFAULT_LOG_DIR = Path("data/logs")
 
 
-def send_tick() -> int:
-  resp = requests.post(f"{BASE_URL}/tick")
-  resp.raise_for_status()
-  data: Dict[str, int] = resp.json()
-  return data["day"]
+def load_config(path: str | None) -> dict[str, Any]:
+  if path is None:
+    return {}
+
+  cfg_path = Path(path)
+  with cfg_path.open("r", encoding="utf-8") as handle:
+    return json.load(handle)
 
 
-def get_state(player_id: str) -> PlayerState:
-  resp = requests.get(f"{BASE_URL}/state/{player_id}")
-  resp.raise_for_status()
-  data = resp.json()
-  state = PlayerState.model_validate(data)
-  return state
+def parse_args() -> argparse.Namespace:
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--session-id", default="manual")
+  parser.add_argument("--config", type=str)
+  parser.add_argument("--agents", type=int)
+  parser.add_argument("--houses", type=int)
+  parser.add_argument("--days", type=int)
+  parser.add_argument("--share", type=str)
+  parser.add_argument("--noise", type=float)
+  parser.add_argument("--graph", type=str)
+  parser.add_argument("--seed", type=int)
+  parser.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR))
+  return parser.parse_args()
 
 
-def action_to_request(action: Action) -> Dict:
-  payload: Dict = {}
-
-  if action.direction is not None:
-    payload["direction"] = action.direction
-
-  if action.accept_house_swap is not None:
-    payload["accept_house_swap"] = action.accept_house_swap
-
-  if action.accept_pet_swap is not None:
-    payload["accept_pet_swap"] = action.accept_pet_swap
-
-  body: Dict = {
-    "player_id": action.player_id,
-    "day": action.day,
-    "type": action.type,
-    "payload": payload or None,
-  }
-
-  return body
-
-
-def send_action(action: Action) -> None:
-  body = action_to_request(action)
-  resp = requests.post(f"{BASE_URL}/action", json = body)
-  resp.raise_for_status()
+def merge_cli_into_config(cfg: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+  merged = dict(cfg)
+  for key in ("agents", "houses", "days", "share", "noise", "graph", "seed"):
+    value = getattr(args, key)
+    if value is not None:
+      merged[key] = value
+  return merged
 
 
 def main() -> None:
-  player_id = "german"
-  belief = BeliefState()
-
-  for step in range(5):
-    day = send_tick()
-    print(f"=== day {day} ===")
-
-    # состояние ДО действия
-    state_before = get_state(player_id)
-    loc_before = state_before.you.get("location")
-    print(f"before: location = {loc_before}")
-
-    action, belief = decide_action(state_before, belief)
-    sa_value = calc_sa(belief)
-
-    send_action(action)
-    print(f"action: {action.type}, direction = {action.direction}")
-    print(f"SA: {sa_value:.2f}")
-
-    # состояние ПОСЛЕ действия
-    state_after = get_state(player_id)
-    loc_after = state_after.you.get("location")
-    print(f"after: location = {loc_after}")
-    print()
-
-  print("simulation finished")
-
-  events = get_log()
-  save_log_csv(events)
+  args = parse_args()
+  cfg = merge_cli_into_config(load_config(args.config), args)
+  log_dir = Path(args.log_dir)
+  result = run_session(session_id=args.session_id, cfg=cfg, log_dir=log_dir)
+  print(json.dumps({key: str(value) for key, value in result.items()}, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

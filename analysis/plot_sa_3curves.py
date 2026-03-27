@@ -1,77 +1,106 @@
+from __future__ import annotations
+
 import argparse
 import csv
-import math
-from glob import glob
-from typing import Dict, List, Tuple
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 
 
-def read_sa(path: str) -> Dict[int, Tuple[float, float]]:
-  out: Dict[int, Tuple[float, float]] = {}
-  with open(path, "r", newline="") as f:
-    reader = csv.DictReader(f, delimiter=";")
-    for r in reader:
-      day = int(r["day"])
-      out[day] = (float(r["avg_sa_any"]), float(r["avg_sa_m1"]))
-  return out
+def _detect_delimiter(path: Path) -> str:
+  with path.open("r", encoding="utf-8") as handle:
+    first_line = handle.readline()
+  return ";" if first_line.count(";") >= first_line.count(",") else ","
 
 
-def mean(xs: List[float]) -> float:
-  return sum(xs) / len(xs) if xs else 0.0
+def _read_metric_series(path: Path, metric_name: str) -> list[tuple[int, float]]:
+  delimiter = _detect_delimiter(path)
+
+  with path.open("r", encoding="utf-8", newline="") as handle:
+    reader = csv.DictReader(handle, delimiter=delimiter)
+    fieldnames = list(reader.fieldnames or [])
+    if not fieldnames:
+      return []
+
+    if "agent" in fieldnames and "day" in fieldnames:
+      if metric_name not in fieldnames:
+        return []
+      by_day: dict[int, list[float]] = {}
+      for row in reader:
+        try:
+          day = int(float(row["day"]))
+          value = float(row[metric_name])
+        except Exception:
+          continue
+        by_day.setdefault(day, []).append(value)
+      return [(day, sum(values) / len(values)) for day, values in sorted(by_day.items()) if values]
+
+    if "day" in fieldnames:
+      if metric_name not in fieldnames:
+        return []
+      series: list[tuple[int, float]] = []
+      for row in reader:
+        try:
+          day = int(float(row["day"]))
+          value = float(row[metric_name])
+        except Exception:
+          continue
+        series.append((day, value))
+      return series
+
+    return []
 
 
-def std(xs: List[float]) -> float:
-  if len(xs) < 2:
-    return 0.0
-  m = mean(xs)
-  return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+def plot_three_curves(metrics_path: Path, out_path: Path, title: str | None = None) -> None:
+  candidates = ["m1_personal", "m2_zebra", "zebra_resolved"]
+  labels: dict[str, str] = {
+    "m1_personal": "M1",
+    "m2_zebra": "M2",
+    "zebra_resolved": "Zebra resolved",
+  }
+
+  plt.figure(figsize=(9, 5))
+  plotted = 0
+
+  for metric_name in candidates:
+    series = _read_metric_series(metrics_path, metric_name)
+    if not series:
+      continue
+    x = [day for day, _ in series]
+    y = [value for _, value in series]
+    plt.plot(x, y, marker="o", linewidth=1.5, label=labels.get(metric_name, metric_name))
+    plotted += 1
+
+  if plotted == 0:
+    raise RuntimeError(f"В {metrics_path} нет подходящих колонок для 3-кривой визуализации")
+
+  plt.xlabel("Day")
+  plt.ylabel("Value")
+  plt.title(title or "SA curves")
+  plt.grid(True, alpha=0.3)
+  plt.legend()
+  plt.tight_layout()
+  out_path.parent.mkdir(parents=True, exist_ok=True)
+  plt.savefig(out_path, dpi=150)
+  plt.close()
 
 
-def agg(paths: List[str], col: int) -> Tuple[List[int], List[float], List[float]]:
-  runs = [read_sa(p) for p in paths]
-  days = sorted(runs[0].keys())
-
-  y_mean: List[float] = []
-  y_std: List[float] = []
-
-  for d in days:
-    vals = [r[d][col] for r in runs]
-    y_mean.append(mean(vals))
-    y_std.append(std(vals))
-
-  return days, y_mean, y_std
+def build_arg_parser() -> argparse.ArgumentParser:
+  parser = argparse.ArgumentParser(description="Plot 3 SA-related curves from metrics file")
+  parser.add_argument("--metrics", required=True)
+  parser.add_argument("--out", required=True)
+  parser.add_argument("--title", default=None)
+  return parser
 
 
 def main() -> None:
-  ap = argparse.ArgumentParser()
-  ap.add_argument("--none", required = True)
-  ap.add_argument("--meet", required = True)
-  ap.add_argument("--noise", required = True)
-  ap.add_argument("--metric", choices = ["any", "m1"], default = "m1")
-  ap.add_argument("--out", required = True)
-  args = ap.parse_args()
-
-  col = 0 if args.metric == "any" else 1
-
-  none_paths = sorted(glob(args.none))
-  meet_paths = sorted(glob(args.meet))
-  noise_paths = sorted(glob(args.noise))
-
-  x1, y1, e1 = agg(none_paths, col)
-  x2, y2, e2 = agg(meet_paths, col)
-  x3, y3, e3 = agg(noise_paths, col)
-
-  plt.errorbar(x1, y1, yerr = e1, marker = "o", linewidth = 1, label = "none")
-  plt.errorbar(x2, y2, yerr = e2, marker = "o", linewidth = 1, label = "meet")
-  plt.errorbar(x3, y3, yerr = e3, marker = "o", linewidth = 1, label = "meet+noise")
-
-  plt.xlabel("day")
-  plt.ylabel("avg SA")
-  plt.grid(True, alpha = 0.3)
-  plt.legend()
-  plt.savefig(args.out, dpi = 200, bbox_inches = "tight")
-  print(f"saved {args.out}")
+  args = build_arg_parser().parse_args()
+  plot_three_curves(
+    metrics_path=Path(args.metrics),
+    out_path=Path(args.out),
+    title=args.title,
+  )
+  print(args.out)
 
 
 if __name__ == "__main__":

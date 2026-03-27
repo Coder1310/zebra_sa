@@ -1,417 +1,503 @@
+from __future__ import annotations
+
 import argparse
 import csv
 import json
 import os
 import random
-import re
 import time
 from dataclasses import dataclass
 from glob import glob
+from typing import Any
 
 import requests
 
 
-@dataclass(frozen = True)
+@dataclass(frozen=True)
 class Strategy:
-  p_left: int
-  p_right: int
-  p_home: int
+  p_to: list[int]
   p_house_exch: int
   p_pet_exch: int
 
-  def as_dict(self) -> dict:
+  def as_dict(self) -> dict[str, Any]:
     return {
-      "p_left": self.p_left,
-      "p_right": self.p_right,
-      "p_home": self.p_home,
-      "p_house_exch": self.p_house_exch,
-      "p_pet_exch": self.p_pet_exch,
+      "p_to": list(self.p_to),
+      "p_house_exch": int(self.p_house_exch),
+      "p_pet_exch": int(self.p_pet_exch),
     }
 
 
-def _list_metrics_files(logs_dir: str) -> list[str]:
-  patterns = [
-    os.path.join(logs_dir, "metrics_*.csv"),
-    os.path.join(logs_dir, "metrics-*.csv"),
-    os.path.join(logs_dir, "metrics*.csv"),
-  ]
+@dataclass(frozen=True)
+class TrialResult:
+  score: float
+  session_ids: list[str]
+  metrics_path: str | None
+  metrics_ext_path: str | None
+
+
+def _clamp_int(value: Any, lo: int, hi: int) -> int:
+  try:
+    value = int(value)
+  except Exception:
+    return lo
+  if value < lo:
+    return lo
+  if value > hi:
+    return hi
+  return value
+
+
+def _normalize_int_weights(values: list[int]) -> list[int]:
+  if not values:
+    return []
+  clipped = [max(0, int(v)) for v in values]
+  total = sum(clipped)
+  if total <= 0:
+    out = [0] * len(clipped)
+    out[0] = 100
+    return out
+
+  scaled = [int(round(100 * value / total)) for value in clipped]
+  diff = 100 - sum(scaled)
+  if diff != 0:
+    pivot = max(range(len(scaled)), key=lambda idx: clipped[idx])
+    scaled[pivot] += diff
+  return scaled
+
+
+def _sample_strategy(houses: int, rng: random.Random) -> Strategy:
+  weights = [rng.randint(0, 100) for _ in range(houses)]
+  p_to = _normalize_int_weights(weights)
+  return Strategy(
+    p_to=p_to,
+    p_house_exch=rng.randint(0, 100),
+    p_pet_exch=rng.randint(0, 100),
+  )
+
+
+def _mutate_strategy(base: Strategy, rng: random.Random) -> Strategy:
+  weights = [max(0, value + rng.randint(-20, 20)) for value in base.p_to]
+  if not any(weights):
+    weights[rng.randrange(len(weights))] = 100
+  return Strategy(
+    p_to=_normalize_int_weights(weights),
+    p_house_exch=_clamp_int(base.p_house_exch + rng.randint(-15, 15), 0, 100),
+    p_pet_exch=_clamp_int(base.p_pet_exch + rng.randint(-15, 15), 0, 100),
+  )
+
+
+def _list_files(logs_dir: str, prefixes: list[str]) -> list[str]:
   files: list[str] = []
-  for p in patterns:
-    files.extend(glob(p))
-  files = sorted(set(files), key = lambda x: os.path.getmtime(x) if os.path.exists(x) else 0.0)
+  for prefix in prefixes:
+    files.extend(glob(os.path.join(logs_dir, f"{prefix}*.csv")))
+  files = sorted(set(files), key=lambda path: os.path.getmtime(path) if os.path.exists(path) else 0.0)
   return files
 
 
 def _detect_delimiter(path: str) -> str:
-  with open(path, "r", encoding = "utf-8") as f:
-    head = f.readline()
-  if head.count(";") >= head.count(","):
-    return ";"
-  return ","
+  with open(path, "r", encoding="utf-8") as handle:
+    head = handle.readline()
+  return ";" if head.count(";") >= head.count(",") else ","
 
 
-def _read_metric_series(metrics_csv: str, who: str) -> tuple[list[int], list[float]]:
-  delim = _detect_delimiter(metrics_csv)
+def _read_metric_series(path: str, who: str, metric: str) -> tuple[list[int], list[float]]:
+  delimiter = _detect_delimiter(path)
   days: list[int] = []
-  vals: list[float] = []
-  with open(metrics_csv, "r", encoding = "utf-8", newline = "") as f:
-    reader = csv.DictReader(f, delimiter = delim)
-    if not reader.fieldnames or "day" not in reader.fieldnames:
-      raise RuntimeError(f"bad metrics header: {reader.fieldnames}")
-    if who not in reader.fieldnames:
-      raise RuntimeError(f"cannot find '{who}' column in: {reader.fieldnames[:10]} ...")
+  values: list[float] = []
+
+  with open(path, "r", encoding="utf-8", newline="") as handle:
+    reader = csv.DictReader(handle, delimiter=delimiter)
+    fieldnames = list(reader.fieldnames or [])
+    lowered = {name.strip().lower(): name for name in fieldnames}
+    day_col = lowered.get("day")
+    if day_col is None:
+      raise RuntimeError(f"no day column in {path}")
+
+    is_long = "agent" in lowered
+    if is_long:
+      agent_col = lowered["agent"]
+      if metric not in fieldnames:
+        raise RuntimeError(f"metric '{metric}' not found in {path}: {fieldnames}")
+      found_agent = False
+      for row in reader:
+        agent = str(row.get(agent_col, "")).strip()
+        if agent != who:
+          continue
+        found_agent = True
+        days.append(int(float(row[day_col])))
+        values.append(float(row[metric]))
+      if not found_agent:
+        raise RuntimeError(f"cannot find agent '{who}' in {path}")
+      return days, values
+
+    if who not in fieldnames:
+      raise RuntimeError(f"cannot find column '{who}' in {path}")
     for row in reader:
-      days.append(int(float(row["day"])))
-      vals.append(float(row[who]))
-  return days, vals
+      days.append(int(float(row[day_col])))
+      values.append(float(row[who]))
+    return days, values
 
 
-def _score(vals: list[float], mode: str, tail: int) -> float:
-  if not vals:
+def _score(days: list[int], values: list[float], mode: str, tail: int, threshold: float) -> float:
+  if not values:
     return 0.0
   if mode == "final":
-    return float(vals[-1])
+    return float(values[-1])
   if mode == "mean_tail":
-    k = min(tail, len(vals))
-    return float(sum(vals[-k:]) / k)
+    k = min(tail, len(values))
+    return float(sum(values[-k:]) / k)
+  if mode == "auc":
+    return float(sum(values) / len(values))
+  if mode == "time_to_threshold":
+    for index, value in enumerate(values, start=1):
+      if value >= threshold:
+        return 1.0 - (index - 1) / max(1, len(values))
+    return 0.0
   raise ValueError(mode)
 
 
-def _parse_kv_text(text: str) -> dict:
-  out: dict[str, str] = {}
-  for m in re.finditer(r"(\w+)\s*=\s*([^\s]+)", text):
-    out[m.group(1)] = m.group(2)
-  return out
+def _create_session(api_base: str, cfg: dict[str, Any]) -> str:
+  response = requests.post(f"{api_base}/session/create", json=cfg, timeout=60)
+  response.raise_for_status()
 
-
-def _create_session(api: str, cfg: dict) -> str:
-  r = requests.post(f"{api}/session/create", json = cfg, timeout = 60)
-  r.raise_for_status()
-
-  sid = None
   try:
-    data = r.json()
-    sid = data.get("session_id") or data.get("session") or data.get("sid") or data.get("id")
-  except Exception:
-    pass
+    data = response.json()
+  except json.JSONDecodeError:
+    text = response.text.strip().strip('"').strip("'")
+    if not text:
+      raise RuntimeError(f"cannot parse session id from {response.text!r}")
+    return text
 
-  if not sid:
-    t = r.text.strip()
-    if t.startswith("{") and t.endswith("}"):
-      try:
-        data = json.loads(t)
-        sid = data.get("session_id") or data.get("session") or data.get("sid") or data.get("id")
-      except Exception:
-        sid = None
-
-  if not sid:
-    sid = r.text.strip().strip('"').strip("'")
-
-  if not sid:
-    raise RuntimeError(f"cannot parse session id: {r.text}")
-
-  return str(sid)
+  for key in ("session_id", "session", "sid", "id"):
+    value = data.get(key)
+    if value:
+      return str(value)
+  raise RuntimeError(f"cannot parse session id from {data}")
 
 
-def _try_get_json(resp: requests.Response) -> dict:
-  try:
-    data = resp.json()
-    if isinstance(data, dict):
-      return data
-  except Exception:
-    pass
-  t = resp.text if isinstance(resp.text, str) else ""
-  kv = _parse_kv_text(t)
-  if kv:
-    return kv
-  return {}
-
-
-def _extract_paths(info: dict) -> tuple[str | None, str | None, str | None, str | None]:
-  status = None
-  metrics = None
-  csv_path = None
-  xml_path = None
-
-  if isinstance(info, dict):
-    status = info.get("status")
-    metrics = info.get("metrics")
-    csv_path = info.get("csv")
-    xml_path = info.get("xml")
-
-  def _norm(x: str | None) -> str | None:
-    if not isinstance(x, str):
-      return None
-    x = x.strip()
-    return x if x else None
-
-  return _norm(status), _norm(metrics), _norm(csv_path), _norm(xml_path)
-
-
-def _find_new_metrics_file(logs_dir: str, sid: str, t_start: float, prev_set: set[str]) -> str | None:
-  files = _list_metrics_files(logs_dir)
-
-  cand_sid = []
-  cand_any = []
-  for f in files:
+def _find_new_file(logs_dir: str, sid: str, prefixes: list[str], started_at: float, seen: set[str]) -> str | None:
+  candidates: list[str] = []
+  for path in _list_files(logs_dir, prefixes):
+    if path in seen:
+      continue
     try:
-      mt = os.path.getmtime(f)
+      mtime = os.path.getmtime(path)
     except OSError:
       continue
-    if mt < t_start - 0.2:
+    if mtime < started_at - 0.2:
       continue
-    if f in prev_set:
-      continue
-    if sid in os.path.basename(f):
-      cand_sid.append(f)
-    else:
-      cand_any.append(f)
+    candidates.append(path)
 
-  if cand_sid:
-    return max(cand_sid, key = os.path.getmtime)
-  if cand_any:
-    return max(cand_any, key = os.path.getmtime)
-  return None
+  if not candidates:
+    return None
+
+  sid_matches = [path for path in candidates if sid in os.path.basename(path)]
+  if sid_matches:
+    return max(sid_matches, key=os.path.getmtime)
+  return max(candidates, key=os.path.getmtime)
 
 
-def _wait_run_done(api: str, sid: str, logs_dir: str, wait_sec: float) -> tuple[str, str | None, str | None]:
-  prev_files = set(_list_metrics_files(logs_dir))
-  t_start = time.time()
+def _extract_paths(info: dict[str, Any]) -> tuple[str | None, str | None, str | None, str | None, str | None]:
+  def _clean(value: Any) -> str | None:
+    if not isinstance(value, str):
+      return None
+    value = value.strip()
+    return value or None
 
-  last_status = None
-  last_deadline = None
-  last_info = None
+  return (
+    _clean(info.get("status")),
+    _clean(info.get("metrics")),
+    _clean(info.get("metrics_ext")),
+    _clean(info.get("csv")),
+    _clean(info.get("xml")),
+  )
 
-  while time.time() - t_start < wait_sec:
+
+def _wait_run_done(api_base: str, sid: str, logs_dir: str, wait_sec: float) -> dict[str, str | None]:
+  started_at = time.time()
+  seen_metrics = set(_list_files(logs_dir, ["metrics_", "metrics-", "metrics"]))
+  seen_metrics_ext = set(_list_files(logs_dir, ["metrics_ext_", "metrics_ext-"]))
+
+  last_info: dict[str, Any] | None = None
+  while time.time() - started_at < wait_sec:
     try:
-      r = requests.post(f"{api}/session/{sid}/run", timeout=60)
-      r.raise_for_status()
-      info = _try_get_json(r)
-      last_info = info
-      status, metrics, csv_path, xml_path = _extract_paths(info)
+      response = requests.post(f"{api_base}/session/{sid}/run", timeout=60)
+      response.raise_for_status()
+      data = response.json()
+      last_info = data if isinstance(data, dict) else {}
+    except (requests.RequestException, json.JSONDecodeError):
+      data = {}
 
-      if status:
-        last_status = status
-      if isinstance(info, dict) and "deadline" in info:
-        try:
-          last_deadline = float(info["deadline"])
-        except Exception:
-          last_deadline = None
+    status, metrics_path, metrics_ext_path, csv_path, xml_path = _extract_paths(data)
 
-      if metrics and os.path.exists(metrics):
-        return metrics, csv_path, xml_path
-      if metrics and os.path.exists(os.path.join(logs_dir, os.path.basename(metrics))):
-        return os.path.join(logs_dir, os.path.basename(metrics)), csv_path, xml_path
+    if metrics_path and os.path.exists(metrics_path):
+      return {
+        "metrics": metrics_path,
+        "metrics_ext": metrics_ext_path if metrics_ext_path and os.path.exists(metrics_ext_path) else metrics_ext_path,
+        "csv": csv_path,
+        "xml": xml_path,
+      }
 
-      if metrics and (status in (None, "done", "ok", "finished", "complete")):
-        if os.path.exists(metrics):
-          return metrics, csv_path, xml_path
+    discovered_metrics = _find_new_file(logs_dir, sid, ["metrics_", "metrics-", "metrics"], started_at, seen_metrics)
+    discovered_metrics_ext = _find_new_file(logs_dir, sid, ["metrics_ext_", "metrics_ext-"], started_at, seen_metrics_ext)
 
-      if (status in ("done", "ok", "finished", "complete")) and metrics:
-        return metrics, csv_path, xml_path
+    if status in {"done", "ok", "finished", "complete"} and (metrics_path or discovered_metrics):
+      return {
+        "metrics": metrics_path or discovered_metrics,
+        "metrics_ext": metrics_ext_path or discovered_metrics_ext,
+        "csv": csv_path,
+        "xml": xml_path,
+      }
 
-      new_m = _find_new_metrics_file(logs_dir, sid, t_start, prev_files)
-      if new_m is not None:
-        return new_m, csv_path, xml_path
+    if discovered_metrics or discovered_metrics_ext:
+      return {
+        "metrics": metrics_path or discovered_metrics,
+        "metrics_ext": metrics_ext_path or discovered_metrics_ext,
+        "csv": csv_path,
+        "xml": xml_path,
+      }
 
-    except Exception:
-      new_m = _find_new_metrics_file(logs_dir, sid, t_start, prev_files)
-      if new_m is not None:
-        return new_m, None, None
-
-    if last_deadline is not None:
-      dt = max(0.05, min(1.0, last_deadline - time.time()))
-      time.sleep(dt)
-    else:
-      time.sleep(0.2)
+    time.sleep(0.2)
 
   raise RuntimeError(
     "run timeout\n"
-    f"sid = {sid}\n"
-    f"last_status = {last_status}\n"
-    f"last_deadline = {last_deadline}\n"
-    f"last_info = {last_info}\n"
-    f"last_metrics_files = {_list_metrics_files(logs_dir)[-5:]}\n"
+    f"sid={sid}\n"
+    f"last_info={last_info}\n"
+    f"metrics_tail={_list_files(logs_dir, ['metrics_', 'metrics-', 'metrics'])[-5:]}\n"
+    f"metrics_ext_tail={_list_files(logs_dir, ['metrics_ext_', 'metrics_ext-'])[-5:]}"
   )
 
 
-def _fix_sum_100(a: int, b: int, c: int) -> tuple[int, int, int]:
-  a = max(0, min(100, a))
-  b = max(0, min(100, b))
-  c = max(0, min(100, c))
-  s = a + b + c
-  if s == 0:
-    return 33, 33, 34
-  a = int(round(a * 100 / s))
-  b = int(round(b * 100 / s))
-  c = 100 - a - b
-  if c < 0:
-    c = 0
-    if a >= b:
-      a = 100 - b
-    else:
-      b = 100 - a
-  return a, b, c
+def _choose_metric_file(paths: dict[str, str | None], metric: str) -> tuple[str, str]:
+  metrics_ext = paths.get("metrics_ext")
+  metrics = paths.get("metrics")
+
+  if metric == "auto":
+    if metrics_ext and os.path.exists(metrics_ext):
+      return metrics_ext, "m1_personal"
+    if metrics and os.path.exists(metrics):
+      return metrics, "m1"
+    raise RuntimeError("no metrics files found")
+
+  if metric in {"m1_personal", "m2_zebra", "known_personal_facts", "correct_personal_facts"}:
+    if not metrics_ext or not os.path.exists(metrics_ext):
+      raise RuntimeError("metrics_ext file is required for the selected metric")
+    return metrics_ext, metric
+
+  if metric == "m1":
+    if metrics and os.path.exists(metrics):
+      return metrics, metric
+    if metrics_ext and os.path.exists(metrics_ext):
+      return metrics_ext, "m1_personal"
+    raise RuntimeError("no compatible metrics file found")
+
+  raise RuntimeError(f"unsupported metric '{metric}'")
 
 
-def _sample_strategy(rng: random.Random) -> Strategy:
-  x1 = rng.random()
-  x2 = rng.random()
-  x3 = rng.random()
-  s = x1 + x2 + x3
-  p_left = int(round(100 * x1 / s))
-  p_right = int(round(100 * x2 / s))
-  p_home = 100 - p_left - p_right
-  p_left, p_right, p_home = _fix_sum_100(p_left, p_right, p_home)
-  return Strategy(
-    p_left = p_left,
-    p_right = p_right,
-    p_home = p_home,
-    p_house_exch = rng.randint(0, 100),
-    p_pet_exch = rng.randint(0, 100),
-  )
-
-
-def _write_yaml(path: str, data: dict) -> None:
+def _write_yaml(path: str, data: dict[str, Any]) -> None:
   lines: list[str] = []
-  for k, v in data.items():
-    if isinstance(v, dict):
-      lines.append(f"{k}:")
-      for kk, vv in v.items():
-        lines.append(f"  {kk}: {vv}")
+  for key, value in data.items():
+    if isinstance(value, dict):
+      lines.append(f"{key}:")
+      for inner_key, inner_value in value.items():
+        lines.append(f"  {inner_key}: {inner_value}")
+    elif isinstance(value, list):
+      lines.append(f"{key}:")
+      for item in value:
+        lines.append(f"  - {item}")
     else:
-      lines.append(f"{k}: {v}")
-  with open(path, "w", encoding = "utf-8") as f:
-    f.write("\n".join(lines) + "\n")
+      lines.append(f"{key}: {value}")
+  with open(path, "w", encoding="utf-8") as handle:
+    handle.write("\n".join(lines) + "\n")
 
 
 def main() -> None:
-  ap = argparse.ArgumentParser()
-  ap.add_argument("--api", default = "http://127.0.0.1:8000")
-  ap.add_argument("--agents", type = int, default = 1000)
-  ap.add_argument("--houses", type = int, default = 6)
-  ap.add_argument("--days", type = int, default = 200)
-  ap.add_argument("--share", default = "meet", choices = ["none", "meet"])
-  ap.add_argument("--noise", type = float, default = 0.2)
-  ap.add_argument("--who", default = "a0")
-  ap.add_argument("--iters", type = int, default = 10)
-  ap.add_argument("--seeds", default = "1,2,3")
-  ap.add_argument("--score", default = "final", choices = ["final", "mean_tail"])
-  ap.add_argument("--tail", type = int, default = 20)
-  ap.add_argument("--wait", type = int, default = 600)
-  ap.add_argument("--out_dir", default = "data/logs")
-  ap.add_argument("--logs_dir", default = "data/logs")
-  ap.add_argument("--rng_seed", type = int, default = 42)
-  args = ap.parse_args()
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--api", default="http://127.0.0.1:8000")
+  parser.add_argument("--agents", type=int, default=1000)
+  parser.add_argument("--houses", type=int, default=6)
+  parser.add_argument("--days", type=int, default=200)
+  parser.add_argument("--share", default="meet", choices=["none", "meet"])
+  parser.add_argument("--noise", type=float, default=0.2)
+  parser.add_argument("--graph", default="ring", choices=["ring", "full"])
+  parser.add_argument("--who", default="a0")
+  parser.add_argument("--iters", type=int, default=10)
+  parser.add_argument("--seeds", default="1,2,3")
+  parser.add_argument("--metric", default="auto", choices=["auto", "m1", "m1_personal", "m2_zebra", "known_personal_facts", "correct_personal_facts"])
+  parser.add_argument("--score", default="final", choices=["final", "mean_tail", "auc", "time_to_threshold"])
+  parser.add_argument("--tail", type=int, default=20)
+  parser.add_argument("--threshold", type=float, default=0.8)
+  parser.add_argument("--wait", type=float, default=600.0)
+  parser.add_argument("--out_dir", default="data/logs")
+  parser.add_argument("--logs_dir", default="data/logs")
+  parser.add_argument("--rng_seed", type=int, default=42)
+  args = parser.parse_args()
 
-  seeds = [int(x) for x in args.seeds.split(",") if x.strip()]
   os.makedirs(args.out_dir, exist_ok=True)
-
   trials_csv = os.path.join(args.out_dir, "mt_trials.csv")
   best_yaml = os.path.join(args.out_dir, "mt_best.yaml")
+  compare_csv = os.path.join(args.out_dir, "mt_compare.csv")
   compare_png = os.path.join(args.out_dir, "mt_compare.png")
 
+  seeds = [int(chunk) for chunk in args.seeds.split(",") if chunk.strip()]
   rng = random.Random(args.rng_seed)
 
-  def eval_strategy(strategy: Strategy | None) -> tuple[float, list[str], list[str]]:
+  def evaluate(strategy: Strategy | None) -> TrialResult:
     scores: list[float] = []
-    sids: list[str] = []
-    metrics_paths: list[str] = []
+    session_ids: list[str] = []
+    last_metrics_path: str | None = None
+    last_metrics_ext_path: str | None = None
 
-    for sd in seeds:
-      cfg = {
+    for seed in seeds:
+      cfg: dict[str, Any] = {
         "agents": args.agents,
         "houses": args.houses,
         "days": args.days,
         "share": args.share,
         "noise": args.noise,
-        "seed": sd,
+        "seed": seed,
+        "graph": args.graph,
       }
       if strategy is not None:
         cfg["mt_who"] = args.who
         cfg["mt_strategy"] = strategy.as_dict()
 
       sid = _create_session(args.api, cfg)
-      metrics_path, _, _ = _wait_run_done(args.api, sid, args.logs_dir, float(args.wait))
+      paths = _wait_run_done(args.api, sid, args.logs_dir, args.wait)
+      metric_path, metric_name = _choose_metric_file(paths, args.metric)
+      days, values = _read_metric_series(metric_path, args.who, metric_name)
+      scores.append(_score(days, values, args.score, args.tail, args.threshold))
+      session_ids.append(sid)
+      last_metrics_path = paths.get("metrics")
+      last_metrics_ext_path = paths.get("metrics_ext")
 
-      _, vals = _read_metric_series(metrics_path, args.who)
-      scores.append(_score(vals, args.score, args.tail))
-      sids.append(sid)
-      metrics_paths.append(metrics_path)
+    return TrialResult(
+      score=float(sum(scores) / len(scores)),
+      session_ids=session_ids,
+      metrics_path=last_metrics_path,
+      metrics_ext_path=last_metrics_ext_path,
+    )
 
-    return float(sum(scores) / len(scores)), sids, metrics_paths
+  baseline_result = evaluate(None)
+  best_strategy = _sample_strategy(args.houses, rng)
+  best_result = evaluate(best_strategy)
 
-  baseline_score, baseline_sids, baseline_metrics = eval_strategy(None)
-
-  best_strategy = _sample_strategy(rng)
-  best_score, best_sids, best_metrics = eval_strategy(best_strategy)
-
-  with open(trials_csv, "w", encoding = "utf-8", newline = "") as f:
-    w = csv.writer(f)
-    w.writerow(["kind", "score", "sids", "metrics", "p_left", "p_right", "p_home", "p_house_exch", "p_pet_exch"])
-    w.writerow(["baseline", baseline_score, "|".join(baseline_sids), "|".join(baseline_metrics), "", "", "", "", ""])
-    w.writerow([
+  with open(trials_csv, "w", encoding="utf-8", newline="") as handle:
+    writer = csv.writer(handle)
+    writer.writerow([
+      "kind",
+      "score",
+      "session_ids",
+      "metrics",
+      "metrics_ext",
+      "p_to",
+      "p_house_exch",
+      "p_pet_exch",
+    ])
+    writer.writerow([
+      "baseline",
+      baseline_result.score,
+      "|".join(baseline_result.session_ids),
+      baseline_result.metrics_path or "",
+      baseline_result.metrics_ext_path or "",
+      "",
+      "",
+      "",
+    ])
+    writer.writerow([
       "trial0",
-      best_score,
-      "|".join(best_sids),
-      "|".join(best_metrics),
-      best_strategy.p_left,
-      best_strategy.p_right,
-      best_strategy.p_home,
+      best_result.score,
+      "|".join(best_result.session_ids),
+      best_result.metrics_path or "",
+      best_result.metrics_ext_path or "",
+      "|".join(str(value) for value in best_strategy.p_to),
       best_strategy.p_house_exch,
       best_strategy.p_pet_exch,
     ])
 
-  for _ in range(args.iters):
-    cand = _sample_strategy(rng)
-    cand_score, cand_sids, cand_metrics = eval_strategy(cand)
-    with open(trials_csv, "a", encoding = "utf-8", newline = "") as f:
-      w = csv.writer(f)
-      w.writerow([
-        "trial",
-        cand_score,
-        "|".join(cand_sids),
-        "|".join(cand_metrics),
-        cand.p_left,
-        cand.p_right,
-        cand.p_home,
-        cand.p_house_exch,
-        cand.p_pet_exch,
-      ])
-    if cand_score > best_score:
-      best_score = cand_score
-      best_strategy = cand
-      best_sids = cand_sids
-      best_metrics = cand_metrics
-      print(f"new best score = {best_score:.4f} strat = {best_strategy}")
+  for trial_index in range(1, args.iters + 1):
+    if rng.random() < 0.3:
+      candidate = _sample_strategy(args.houses, rng)
+    else:
+      candidate = _mutate_strategy(best_strategy, rng)
 
-  _write_yaml(best_yaml, {
-    "who": args.who,
-    "baseline_score": baseline_score,
-    "best_score": best_score,
-    "best_strategy": best_strategy.as_dict(),
-    "baseline_sids": {"sids": "|".join(baseline_sids)},
-    "best_sids": {"sids": "|".join(best_sids)},
-  })
+    candidate_result = evaluate(candidate)
+    with open(trials_csv, "a", encoding="utf-8", newline="") as handle:
+      writer = csv.writer(handle)
+      writer.writerow([
+        f"trial{trial_index}",
+        candidate_result.score,
+        "|".join(candidate_result.session_ids),
+        candidate_result.metrics_path or "",
+        candidate_result.metrics_ext_path or "",
+        "|".join(str(value) for value in candidate.p_to),
+        candidate.p_house_exch,
+        candidate.p_pet_exch,
+      ])
+
+    if candidate_result.score > best_result.score:
+      best_strategy = candidate
+      best_result = candidate_result
+      print(f"new best score={best_result.score:.4f} strategy={best_strategy.as_dict()}")
+
+  _write_yaml(
+    best_yaml,
+    {
+      "who": args.who,
+      "metric": args.metric,
+      "score_mode": args.score,
+      "baseline_score": baseline_result.score,
+      "best_score": best_result.score,
+      "best_strategy": best_strategy.as_dict(),
+      "baseline_session_ids": "|".join(baseline_result.session_ids),
+      "best_session_ids": "|".join(best_result.session_ids),
+      "baseline_metrics": baseline_result.metrics_path or "",
+      "baseline_metrics_ext": baseline_result.metrics_ext_path or "",
+      "best_metrics": best_result.metrics_path or "",
+      "best_metrics_ext": best_result.metrics_ext_path or "",
+    },
+  )
+
+  baseline_metric_path, baseline_metric_name = _choose_metric_file(
+    {"metrics": baseline_result.metrics_path, "metrics_ext": baseline_result.metrics_ext_path},
+    args.metric,
+  )
+  best_metric_path, best_metric_name = _choose_metric_file(
+    {"metrics": best_result.metrics_path, "metrics_ext": best_result.metrics_ext_path},
+    args.metric,
+  )
+  baseline_days, baseline_values = _read_metric_series(baseline_metric_path, args.who, baseline_metric_name)
+  best_days, best_values = _read_metric_series(best_metric_path, args.who, best_metric_name)
+
+  with open(compare_csv, "w", encoding="utf-8", newline="") as handle:
+    writer = csv.writer(handle)
+    writer.writerow(["day", "baseline", "best"])
+    max_len = max(len(baseline_days), len(best_days))
+    for index in range(max_len):
+      writer.writerow([
+        baseline_days[index] if index < len(baseline_days) else best_days[index],
+        baseline_values[index] if index < len(baseline_values) else "",
+        best_values[index] if index < len(best_values) else "",
+      ])
 
   try:
     import matplotlib.pyplot as plt
-    d1, v1 = _read_metric_series(baseline_metrics[0], args.who)
-    d2, v2 = _read_metric_series(best_metrics[0], args.who)
+
     plt.figure()
-    plt.plot(d1, v1, label = "baseline")
-    plt.plot(d2, v2, label = "mt_best")
+    plt.plot(baseline_days, baseline_values, label="baseline")
+    plt.plot(best_days, best_values, label="mt_best")
     plt.xlabel("day")
-    plt.ylabel("M1")
+    plt.ylabel(best_metric_name)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(compare_png, dpi = 200)
+    plt.savefig(compare_png, dpi=200)
     print(f"saved {compare_png}")
-  except Exception as e:
-    print(f"skip plot: {e}")
+  except Exception as error:
+    print(f"skip plot: {error}")
 
   print(f"saved {best_yaml}")
   print(f"saved {trials_csv}")
+  print(f"saved {compare_csv}")
 
 
 if __name__ == "__main__":

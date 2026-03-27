@@ -1,56 +1,100 @@
+from __future__ import annotations
+
 import argparse
 import csv
-import math
-from typing import Dict, List, Tuple
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 
 
-def read_sa(path: str) -> Dict[int, float]:
-  out: Dict[int, float] = {}
-  with open(path, "r", newline = "") as f:
-    reader = csv.DictReader(f, delimiter = ";")
-    for r in reader:
-      out[int(r["day"])] = float(r["avg_sa"])
-  return out
+def _detect_delimiter(path: Path) -> str:
+  with path.open("r", encoding="utf-8") as handle:
+    first_line = handle.readline()
+  return ";" if first_line.count(";") >= first_line.count(",") else ","
 
 
-def mean(xs: List[float]) -> float:
-  return sum(xs) / len(xs) if xs else 0.0
+def _read_series(path: Path, metric: str | None) -> tuple[str, list[tuple[int, float]]]:
+  delimiter = _detect_delimiter(path)
+
+  with path.open("r", encoding="utf-8", newline="") as handle:
+    reader = csv.DictReader(handle, delimiter=delimiter)
+    fieldnames = list(reader.fieldnames or [])
+    if not fieldnames:
+      raise RuntimeError(f"Пустой файл метрик: {path}")
+
+    if "agent" in fieldnames and "day" in fieldnames:
+      metric_name = metric or ("m1_personal" if "m1_personal" in fieldnames else fieldnames[-1])
+      by_day: dict[int, list[float]] = {}
+      for row in reader:
+        try:
+          day = int(float(row["day"]))
+          value = float(row[metric_name])
+        except Exception:
+          continue
+        by_day.setdefault(day, []).append(value)
+
+      series = [(day, sum(values) / len(values)) for day, values in sorted(by_day.items()) if values]
+      return metric_name, series
+
+    if "day" in fieldnames:
+      metric_name = metric
+      if not metric_name or metric_name not in fieldnames:
+        candidates = [name for name in fieldnames if name != "day"]
+        if not candidates:
+          raise RuntimeError(f"Не найден metric column в {path}")
+        metric_name = candidates[0]
+
+      series: list[tuple[int, float]] = []
+      for row in reader:
+        try:
+          day = int(float(row["day"]))
+          value = float(row[metric_name])
+        except Exception:
+          continue
+        series.append((day, value))
+      return metric_name, series
+
+    raise RuntimeError(f"Неподдерживаемый формат файла: {path}")
 
 
-def std(xs: List[float]) -> float:
-  if len(xs) < 2:
-    return 0.0
-  m = mean(xs)
-  return math.sqrt(sum((x - m) ** 2 for x in xs) / (len(xs) - 1))
+def plot_sa(metrics_path: Path, out_path: Path, metric: str | None = None, title: str | None = None) -> None:
+  metric_name, series = _read_series(metrics_path, metric)
+  if not series:
+    raise RuntimeError(f"Нет данных для графика в {metrics_path}")
+
+  x = [day for day, _ in series]
+  y = [value for _, value in series]
+
+  plt.figure(figsize=(9, 5))
+  plt.plot(x, y, marker="o", linewidth=1.5)
+  plt.xlabel("Day")
+  plt.ylabel(metric_name)
+  plt.title(title or f"{metric_name} over time")
+  plt.grid(True, alpha=0.3)
+  plt.tight_layout()
+  out_path.parent.mkdir(parents=True, exist_ok=True)
+  plt.savefig(out_path, dpi=150)
+  plt.close()
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+  parser = argparse.ArgumentParser(description="Plot SA metric from metrics.csv or metrics_ext.csv")
+  parser.add_argument("--metrics", required=True)
+  parser.add_argument("--out", required=True)
+  parser.add_argument("--metric", default=None)
+  parser.add_argument("--title", default=None)
+  return parser
 
 
 def main() -> None:
-  ap = argparse.ArgumentParser()
-  ap.add_argument("--inputs", nargs = "+", required = True)
-  ap.add_argument("--label", required = True)
-  ap.add_argument("--out", required = True)
-  args = ap.parse_args()
-
-  runs = [read_sa(p) for p in args.inputs]
-  days = sorted(runs[0].keys())
-
-  y_mean: List[float] = []
-  y_std: List[float] = []
-
-  for d in days:
-    vals = [r[d] for r in runs]
-    y_mean.append(mean(vals))
-    y_std.append(std(vals))
-
-  plt.errorbar(days, y_mean, yerr = y_std, marker = "o", linewidth = 1, label = args.label)
-  plt.xlabel("day")
-  plt.ylabel("avg SA")
-  plt.grid(True, alpha = 0.3)
-  plt.legend()
-  plt.savefig(args.out, dpi = 200, bbox_inches = "tight")
-  print(f"saved {args.out}")
+  args = build_arg_parser().parse_args()
+  plot_sa(
+    metrics_path=Path(args.metrics),
+    out_path=Path(args.out),
+    metric=args.metric,
+    title=args.title,
+  )
+  print(args.out)
 
 
 if __name__ == "__main__":

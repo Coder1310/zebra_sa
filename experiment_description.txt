@@ -1,0 +1,109 @@
+Zebra Puzzle: минимальный набор экспериментов для курсового отчета
+
+1. Что было сделано
+
+Выполнен минимальный набор batch-экспериментов для анализа динамики situational awareness (SA) в проекте Zebra Puzzle.
+Во всех сценариях использовались одинаковые базовые параметры:
+
+- agents = 6
+- houses = 6
+- days = 50
+- runs = 10
+- seed = 1..10
+
+Сравнивались три фактора:
+
+1. Топология графа взаимодействия:
+- ring
+- full
+
+2. Режим обмена знаниями:
+- none
+- meet
+
+3. Уровень шума:
+- noise = 0.0
+- noise = 0.1
+
+Использовались две метрики:
+
+- M1: доля корректно известных игроку фактов
+- M2: знает ли игрок, кто владелец зебры
+
+
+2. Какие команды были выполнены
+
+Запуск экспериментов:
+
+venv/bin/python -m simulator.batch_sim --runs 10 --agents 6 --houses 6 --days 50 --share meet --noise 0.0 --graph ring --seed 1 --out-dir experiments/minimal/ring --prefix ring
+venv/bin/python -m simulator.batch_sim --runs 10 --agents 6 --houses 6 --days 50 --share meet --noise 0.0 --graph full --seed 1 --out-dir experiments/minimal/full --prefix full
+venv/bin/python -m simulator.batch_sim --runs 10 --agents 6 --houses 6 --days 50 --share none --noise 0.0 --graph ring --seed 1 --out-dir experiments/minimal/none --prefix none
+venv/bin/python -m simulator.batch_sim --runs 10 --agents 6 --houses 6 --days 50 --share meet --noise 0.0 --graph ring --seed 1 --out-dir experiments/minimal/meet --prefix meet
+venv/bin/python -m simulator.batch_sim --runs 10 --agents 6 --houses 6 --days 50 --share meet --noise 0.0 --graph ring --seed 1 --out-dir experiments/minimal/noise0 --prefix noise0
+venv/bin/python -m simulator.batch_sim --runs 10 --agents 6 --houses 6 --days 50 --share meet --noise 0.1 --graph ring --seed 1 --out-dir experiments/minimal/noise1 --prefix noise1
+
+Построение графиков:
+
+venv/bin/python -m analysis.plot_sa_compare --metrics experiments/minimal/ring/metrics_ext_ring_0001.csv experiments/minimal/full/metrics_ext_full_0001.csv --metric m1_personal --labels ring full --title "M1(t): ring vs full" --out experiments/minimal/plots/fig1_m1_ring_full.png
+venv/bin/python -m analysis.plot_sa_compare --metrics experiments/minimal/none/metrics_ext_none_0001.csv experiments/minimal/meet/metrics_ext_meet_0001.csv --metric m1_personal --labels none meet --title "M1(t): share none vs meet" --out experiments/minimal/plots/fig2_m1_none_meet.png
+venv/bin/python -m analysis.plot_sa_compare --metrics experiments/minimal/noise0/metrics_ext_noise0_0001.csv experiments/minimal/noise1/metrics_ext_noise1_0001.csv --metric m2_zebra --labels noise0 noise0.1 --title "M2(t): noise 0 vs 0.1" --out experiments/minimal/plots/fig3_m2_noise.png
+
+
+3. Какие файлы включены в архив
+
+Основные результаты лежат в папке experiments/minimal:
+
+- ring/, full/, none/, meet/, noise0/, noise1/
+  В каждой папке лежат:
+  - metrics_*.csv
+  - metrics_ext_*.csv
+  - game_*.csv
+  - game_*.xml
+  - *_summary.csv
+
+- plots/
+  - fig1_m1_ring_full.png
+  - fig2_m1_none_meet.png
+  - fig3_m2_noise.png
+
+- tables/
+  - table_scenarios.csv
+  - table_results.csv
+
+
+4. Реальные итоговые значения
+
+По итогам 10 прогонов на сценарий были получены следующие средние значения:
+
+- ring: avg_final_M1 = 0.9139, avg_final_M2 = 0.5667
+- full: avg_final_M1 = 0.4389, avg_final_M2 = 0.3667
+- none: avg_final_M1 = 0.1319, avg_final_M2 = 0.0167
+- meet: avg_final_M1 = 0.9139, avg_final_M2 = 0.5667
+- noise0: avg_final_M1 = 0.9139, avg_final_M2 = 0.5667
+- noise1: avg_final_M1 = 0.9160, avg_final_M2 = 0.6667
+
+Эти значения автоматически рассчитаны по файлу:
+experiments/minimal/tables/table_results.csv
+
+
+5. Короткий текст для раздела отчета
+
+В экспериментальной части был выполнен минимальный набор batch-экспериментов для оценки динамики situational awareness в системе Zebra Puzzle. Во всех сценариях использовались одинаковые базовые параметры: 6 агентов, 6 домов, 50 дней симуляции и 10 прогонов для каждого варианта настроек. В качестве основных метрик рассматривались M1, отражающая долю корректно известных игроку фактов, и M2, показывающая, знает ли игрок владельца зебры.
+
+Эксперименты были организованы как сравнение трех факторов. В первом сравнении исследовалось влияние топологии графа взаимодействия агентов: ring и full. Во втором сравнении анализировалось влияние режима обмена знаниями: none и meet. В третьем сравнении оценивалось влияние шума наблюдений: noise = 0.0 и noise = 0.1. Во всех случаях остальные параметры симуляции оставались фиксированными.
+
+Для визуального анализа результатов были построены графики динамики метрик. График fig1_m1_ring_full.png используется для сравнения M1(t) в сценариях ring и full. График fig2_m1_none_meet.png показывает влияние обмена знаниями на динамику M1(t). График fig3_m2_noise.png отражает изменение M2(t) при наличии и отсутствии шума.
+
+Итоговые усредненные значения метрик сведены в таблицу table_results.csv. По полученным данным сценарий none показал наихудшие результаты: avg_final_M1 = 0.1319 и avg_final_M2 = 0.0167. Сценарии ring и meet дали одинаковые средние значения avg_final_M1 = 0.9139 и avg_final_M2 = 0.5667. Для сценария full получены более низкие значения avg_final_M1 = 0.4389 и avg_final_M2 = 0.3667. В сравнении noise0 и noise1 в выполненной серии прогонов значения оказались близкими, причем для noise1 наблюдалось avg_final_M1 = 0.9160 и avg_final_M2 = 0.6667.
+
+Таким образом, минимальный набор экспериментов позволил получить реальные графики и таблицы для курсового отчета и продемонстрировать, что выбранные параметры среды влияют на динамику формирования SA. При интерпретации результатов необходимо ориентироваться именно на полученные в проекте данные, представленные в приложенных таблицах и графиках.
+
+
+6. Как подписывать рисунки и таблицы
+
+Рисунок 1. Динамика M1(t) при сравнении топологий ring и full.
+Рисунок 2. Динамика M1(t) при сравнении режимов обмена знаниями none и meet.
+Рисунок 3. Динамика M2(t) при сравнении сценариев с шумом и без шума.
+
+Таблица 1. Параметры экспериментальных сценариев.
+Таблица 2. Итоговые усредненные значения метрик M1 и M2 по сценариям.

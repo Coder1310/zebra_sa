@@ -3,291 +3,276 @@ from __future__ import annotations
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
 
+from core.schema import Action
 from simulator.engine import run_session
-from simulator.interactive_game import InteractiveGame, Action
+from simulator.interactive_game import InteractiveGame
 
+APP_ROOT = Path(__file__).resolve().parents[1]
+LOG_DIR = APP_ROOT / "data" / "logs"
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
-LOG_DIR = ROOT_DIR / "data" / "logs"
-
-
-class MTStrategy(BaseModel):
-  model_config = ConfigDict(extra="allow")
-  p_to: Optional[list[int]] = None
-  p_house_exch: Optional[int] = None
-  p_pet_exch: Optional[int] = None
-
-
-class CreateSessionRequest(BaseModel):
-  model_config = ConfigDict(extra="allow")
-
-  agents: int = Field(default=6, ge=1, le=20000)
-  houses: int = Field(default=6, ge=2, le=50)
-  days: int = Field(default=50, ge=1, le=20000)
-
-  share: str = Field(default="meet")
-  noise: float = Field(default=0.2, ge=0.0, le=1.0)
-  seed: Optional[int] = None
-
-  graph: str = Field(default="ring")
-  use_zebra_defaults: bool = True
-
-  strategies: Optional[dict[str, dict[str, Any]]] = None
-  sleep_ms_per_day: int = Field(default=0, ge=0, le=60000)
-
-  mt_who: Optional[str] = None
-  mt_strategy: Optional[MTStrategy] = None
-
-
-class CreateSessionResponse(BaseModel):
-  session_id: str
-
-
-class RunResponse(BaseModel):
-  status: str
-  session_id: str
-  csv: str
-  xml: str
-  metrics: str
-  finished_at: float
-
-
-class HumanPlayer(BaseModel):
-  user_id: int
-  name: str
-  role: str
-
-
-class CreateGameRequest(BaseModel):
-  model_config = ConfigDict(extra="allow")
-
-  agents: int = Field(default=6, ge=3, le=20)
-  houses: int = Field(default=6, ge=2, le=50)
-  days: int = Field(default=50, ge=1, le=20000)
-
-  share: str = Field(default="meet")
-  noise: float = Field(default=0.2, ge=0.0, le=1.0)
-  seed: Optional[int] = None
-
-  graph: str = Field(default="ring")
-  strategies: Optional[dict[str, dict[str, Any]]] = None
-
-  humans: list[HumanPlayer]
-
-
-class CreateGameResponse(BaseModel):
-  game_id: str
-
-
-class ActionRequest(BaseModel):
-  user_id: int
-  kind: str
-  dst: Optional[int] = None
-  target: Optional[str] = None
-
-
-class StepResponse(BaseModel):
-  game_id: str
-  done: bool
-  day_finished: Optional[int] = None
-  leaderboard: Optional[list[list[Any]]] = None
-  files: Optional[dict[str, str]] = None
-  pending_user_ids: list[int] = []
-  reports: Optional[dict[str, list[str]]] = None
-
-
-class StateResponse(BaseModel):
-  game_id: str
-  day: int
-  days_total: int
-  graph: str
-  pending_user_ids: list[int]
-  m1: dict[str, float]
-
-
-class PlayerStateResponse(BaseModel):
-  ok: bool
-  reason: Optional[str] = None
-
-  role: Optional[str] = None
-  day: Optional[int] = None
-  days_total: Optional[int] = None
-  home: Optional[int] = None
-  location: Optional[int] = None
-  left_house: Optional[int] = None
-  right_house: Optional[int] = None
-  graph: Optional[str] = None
-
-  trip: Optional[dict[str, Any]] = None
-  pet: Optional[str] = None
-  drink: Optional[str] = None
-  smoke: Optional[str] = None
-  m1: Optional[float] = None
-
-  co_located_all: Optional[list[str]] = None
-  co_located_humans: Optional[list[str]] = None
-  pet_offers_in: Optional[list[str]] = None
-
-  knowledge: Optional[list[dict[str, Any]]] = None
-
-
-app = FastAPI(title="Zebra SA Server")
+app = FastAPI(title="Zebra Puzzle API")
 
 _sessions: dict[str, dict[str, Any]] = {}
 _games: dict[str, InteractiveGame] = {}
 
 
-def _new_id() -> str:
-  return uuid.uuid4().hex[:12]
+class SessionCreateRequest(BaseModel):
+  agents: int = 6
+  houses: int = 6
+  days: int = 50
+  share: str = "meet"
+  noise: float = 0.0
+  graph: str = "ring"
+  seed: int | None = None
+  sleep_ms_per_day: int = 0
+  strategies: dict[str, Any] | None = None
+  mt_who: str | None = None
+  mt_strategy: dict[str, Any] | None = None
+
+
+class ActionRequest(BaseModel):
+  kind: str
+  dst: int | None = None
+  target: str | None = None
+
+
+class GameCreateRequest(BaseModel):
+  cfg: dict[str, Any] = Field(default_factory=dict)
+  humans: dict[int, str] = Field(default_factory=dict)
+
+
+class VoteRequest(BaseModel):
+  user_id: int
+  vote: str
+
+
+def _now() -> float:
+  return time.time()
+
+
+def _new_id(prefix: str) -> str:
+  return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def _normalize_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
+  out = dict(cfg)
+  out.setdefault("agents", 6)
+  out.setdefault("houses", 6)
+  out.setdefault("days", 50)
+  out.setdefault("share", "meet")
+  out.setdefault("noise", 0.0)
+  out.setdefault("graph", "ring")
+  out.setdefault("seed", None)
+  out.setdefault("sleep_ms_per_day", 0)
+  return out
+
+
+def _normalize_humans(raw: dict[int, str] | dict[str, str]) -> dict[int, str]:
+  humans: dict[int, str] = {}
+  for user_id, role in raw.items():
+    humans[int(user_id)] = str(role)
+  return humans
+
+
+def _resolve_paths(files: dict[str, str] | dict[str, Path] | None) -> dict[str, str]:
+  out: dict[str, str] = {}
+  if not files:
+    return out
+  for key, value in files.items():
+    out[str(key)] = str(value)
+  return out
+
+
+def _session_summary(session_id: str) -> dict[str, Any]:
+  row = _sessions.get(session_id)
+  if row is None:
+    raise HTTPException(status_code=404, detail="session not found")
+
+  return {
+    "session_id": session_id,
+    "created_at": row["created_at"],
+    "finished_at": row.get("finished_at"),
+    "cfg": row["cfg"],
+    "done": row.get("done", False),
+    "files": _resolve_paths(row.get("files")),
+  }
+
+
+def _game_summary(game_id: str) -> dict[str, Any]:
+  game = _games.get(game_id)
+  if game is None:
+    raise HTTPException(status_code=404, detail="game not found")
+  state = game.state()
+  state["game_id"] = game_id
+  return state
+
+
+@app.get("/")
+def root() -> dict[str, Any]:
+  return {
+    "ok": True,
+    "service": "zebra-api",
+    "sessions": len(_sessions),
+    "games": len(_games),
+  }
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-  return {"status": "ok"}
+def health() -> dict[str, Any]:
+  return {"ok": True, "time": _now()}
 
 
-@app.post("/session/create", response_model=CreateSessionResponse)
-def create_session(req: CreateSessionRequest) -> CreateSessionResponse:
-  LOG_DIR.mkdir(parents=True, exist_ok=True)
-  sid = _new_id()
-  cfg = req.model_dump()
-  _sessions[sid] = {"created_at": time.time(), "cfg": cfg, "done": False, "files": None}
-  return CreateSessionResponse(session_id=sid)
+@app.post("/session/new")
+def create_session(req: SessionCreateRequest) -> dict[str, Any]:
+  session_id = _new_id("session")
+  cfg = _normalize_cfg(req.model_dump())
 
-
-@app.post("/session/{sid}/run", response_model=RunResponse)
-def run_session_endpoint(sid: str) -> RunResponse:
-  s = _sessions.get(sid)
-  if s is None:
-    raise HTTPException(status_code=404, detail="unknown session_id")
-
-  if s["done"] and s["files"] is not None:
-    files = s["files"]
-    return RunResponse(
-      status="done",
-      session_id=sid,
-      csv=str(files["csv"]),
-      xml=str(files["xml"]),
-      metrics=str(files["metrics"]),
-      finished_at=float(files["finished_at"]),
-    )
-
-  cfg = dict(s["cfg"])
-  files = run_session(session_id=sid, cfg=cfg, log_dir=LOG_DIR)
-
-  s["done"] = True
-  s["files"] = files
-
-  return RunResponse(
-    status="done",
-    session_id=sid,
-    csv=str(files["csv"]),
-    xml=str(files["xml"]),
-    metrics=str(files["metrics"]),
-    finished_at=float(files["finished_at"]),
-  )
-
-
-@app.post("/game/create", response_model=CreateGameResponse)
-def create_game(req: CreateGameRequest) -> CreateGameResponse:
-  LOG_DIR.mkdir(parents=True, exist_ok=True)
-  gid = _new_id()
-
-  humans_map: dict[int, str] = {}
-  for p in req.humans:
-    humans_map[int(p.user_id)] = str(p.role)
-
-  cfg = req.model_dump()
-  game = InteractiveGame(game_id=gid, cfg=cfg, humans=humans_map, log_dir=LOG_DIR)
-  _games[gid] = game
-
-  return CreateGameResponse(game_id=gid)
-
-
-@app.get("/game/{gid}/state", response_model=StateResponse)
-def game_state(gid: str) -> StateResponse:
-  game = _games.get(gid)
-  if game is None:
-    raise HTTPException(status_code=404, detail="unknown game_id")
-  s = game.state()
-  return StateResponse(
-    game_id=s["game_id"],
-    day=int(s["day"]),
-    days_total=int(s["days_total"]),
-    graph=str(s["graph"]),
-    pending_user_ids=list(s["pending_user_ids"]),
-    m1={k: float(v) for k, v in s["m1"].items()},
-  )
-
-
-@app.get("/game/{gid}/player_state", response_model=PlayerStateResponse)
-def game_player_state(gid: str, user_id: int = Query(...)) -> PlayerStateResponse:
-  game = _games.get(gid)
-  if game is None:
-    raise HTTPException(status_code=404, detail="unknown game_id")
-
-  s = game.player_state(int(user_id))
-  return PlayerStateResponse(**s)
-
-
-@app.post("/game/{gid}/action")
-def game_action(gid: str, req: ActionRequest) -> dict[str, Any]:
-  game = _games.get(gid)
-  if game is None:
-    raise HTTPException(status_code=404, detail="unknown game_id")
-
-  kind = str(req.kind)
-  allowed = {
-    "stay", "left", "right", "go_to",
-    "house_exchange", "pet_exchange",
-    "pet_offer", "pet_accept", "pet_decline",
+  _sessions[session_id] = {
+    "session_id": session_id,
+    "created_at": _now(),
+    "cfg": cfg,
+    "done": False,
+    "files": {},
   }
-  if kind not in allowed:
-    raise HTTPException(status_code=400, detail="bad action kind")
-
-  res = game.set_action(int(req.user_id), Action(kind=kind, dst=req.dst, target=req.target))
-  return res
+  return _session_summary(session_id)
 
 
-@app.post("/game/{gid}/step", response_model=StepResponse)
-def game_step(gid: str) -> StepResponse:
-  game = _games.get(gid)
+@app.get("/session/{session_id}")
+def get_session(session_id: str) -> dict[str, Any]:
+  return _session_summary(session_id)
+
+
+@app.post("/session/{session_id}/run")
+def run_saved_session(session_id: str) -> dict[str, Any]:
+  row = _sessions.get(session_id)
+  if row is None:
+    raise HTTPException(status_code=404, detail="session not found")
+
+  result = run_session(session_id, row["cfg"], LOG_DIR)
+  row["done"] = True
+  row["finished_at"] = result.get("finished_at", _now())
+  row["files"] = result
+  return _session_summary(session_id)
+
+
+@app.post("/simulate")
+def simulate(req: SessionCreateRequest) -> dict[str, Any]:
+  session_id = _new_id("session")
+  cfg = _normalize_cfg(req.model_dump())
+
+  result = run_session(session_id, cfg, LOG_DIR)
+  _sessions[session_id] = {
+    "session_id": session_id,
+    "created_at": _now(),
+    "finished_at": result.get("finished_at", _now()),
+    "cfg": cfg,
+    "done": True,
+    "files": result,
+  }
+  return {
+    "ok": True,
+    "session_id": session_id,
+    "files": _resolve_paths(result),
+  }
+
+
+@app.post("/game/new")
+def create_game(req: GameCreateRequest) -> dict[str, Any]:
+  game_id = _new_id("game")
+  cfg = _normalize_cfg(req.cfg)
+  humans = _normalize_humans(req.humans)
+
+  game = InteractiveGame(
+    game_id=game_id,
+    cfg=cfg,
+    humans=humans,
+    log_dir=LOG_DIR,
+  )
+  _games[game_id] = game
+
+  return {
+    "ok": True,
+    "game_id": game_id,
+    "cfg": cfg,
+    "humans": humans,
+    "state": game.state(),
+  }
+
+
+@app.get("/game/{game_id}")
+def get_game(game_id: str) -> dict[str, Any]:
+  return _game_summary(game_id)
+
+
+@app.get("/game/{game_id}/state")
+def get_game_state(game_id: str) -> dict[str, Any]:
+  return _game_summary(game_id)
+
+
+@app.get("/game/{game_id}/player/{user_id}")
+def get_player_state(game_id: str, user_id: int) -> dict[str, Any]:
+  game = _games.get(game_id)
   if game is None:
-    raise HTTPException(status_code=404, detail="unknown game_id")
+    raise HTTPException(status_code=404, detail="game not found")
+  return game.player_state(user_id)
 
+
+@app.post("/game/{game_id}/action/{user_id}")
+def set_game_action(game_id: str, user_id: int, req: ActionRequest) -> dict[str, Any]:
+  game = _games.get(game_id)
+  if game is None:
+    raise HTTPException(status_code=404, detail="game not found")
+  return game.set_action(
+    user_id,
+    Action(kind=req.kind, dst=req.dst, target=req.target),
+  )
+
+
+@app.post("/game/{game_id}/step")
+def step_game(game_id: str) -> dict[str, Any]:
+  game = _games.get(game_id)
+  if game is None:
+    raise HTTPException(status_code=404, detail="game not found")
   result = game.step_day()
-  s2 = game.state() if not result.get("done") else {"pending_user_ids": []}
-
-  return StepResponse(
-    game_id=gid,
-    done=bool(result.get("done")),
-    day_finished=int(result.get("day_finished")) if result.get("day_finished") is not None else None,
-    leaderboard=[[name, float(val)] for name, val in (result.get("leaderboard") or [])],
-    files=result.get("files"),
-    pending_user_ids=list(s2.get("pending_user_ids", [])),
-    reports=result.get("reports") or {},
-  )
+  if result.get("done"):
+    result["files"] = _resolve_paths(result.get("files"))
+  return result
 
 
-@app.post("/game/{gid}/finish", response_model=StepResponse)
-def game_finish(gid: str) -> StepResponse:
-  game = _games.get(gid)
+@app.post("/game/{game_id}/finish")
+def finish_game(game_id: str) -> dict[str, Any]:
+  game = _games.get(game_id)
   if game is None:
-    raise HTTPException(status_code=404, detail="unknown game_id")
-
+    raise HTTPException(status_code=404, detail="game not found")
   result = game.finish_now()
+  result["files"] = _resolve_paths(result.get("files"))
+  return result
 
-  return StepResponse(
-    game_id=gid,
-    done=True,
-    day_finished=int(result.get("day_finished")) if result.get("day_finished") is not None else None,
-    leaderboard=[[name, float(val)] for name, val in (result.get("leaderboard") or [])],
-    files=result.get("files"),
-    pending_user_ids=[],
-    reports=result.get("reports") or {},
-  )
+
+@app.delete("/game/{game_id}")
+def delete_game(game_id: str) -> dict[str, Any]:
+  game = _games.pop(game_id, None)
+  if game is None:
+    raise HTTPException(status_code=404, detail="game not found")
+  return {"ok": True, "game_id": game_id}
+
+
+@app.get("/debug/games")
+def debug_games() -> dict[str, Any]:
+  return {
+    "ok": True,
+    "games": list(_games.keys()),
+  }
+
+
+@app.get("/debug/sessions")
+def debug_sessions() -> dict[str, Any]:
+  return {
+    "ok": True,
+    "sessions": list(_sessions.keys()),
+  }

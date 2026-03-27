@@ -7,7 +7,6 @@ data/
 data/logs/*
 !data/logs/.gitkeep
 
-*.zip
 *.tgz
 *.gitignore
 submission_prog/

@@ -1,86 +1,129 @@
 from __future__ import annotations
 
-import time
-from typing import Any, Optional
+import json
+from pathlib import Path
+from typing import Any
 
-import yaml
+from zebra_bot.config import STATE_PATH
 
-from zebra_bot.config import BOT_STATE_PATH
+
+def _empty_state() -> dict[str, Any]:
+  return {
+    "games": {},
+    "users": {},
+    "drafts": {},
+  }
 
 
 def load_state() -> dict[str, Any]:
-  if not BOT_STATE_PATH.exists():
-    return {}
+  path = Path(STATE_PATH)
+  if not path.exists():
+    return _empty_state()
+
   try:
-    return yaml.safe_load(BOT_STATE_PATH.read_text(encoding="utf-8")) or {}
+    data = json.loads(path.read_text(encoding="utf-8"))
   except Exception:
-    return {}
+    return _empty_state()
+
+  if not isinstance(data, dict):
+    return _empty_state()
+
+  data.setdefault("games", {})
+  data.setdefault("users", {})
+  data.setdefault("drafts", {})
+  return data
 
 
 def save_state(state: dict[str, Any]) -> None:
-  BOT_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-  BOT_STATE_PATH.write_text(
-    yaml.safe_dump(state, allow_unicode=True, sort_keys=False),
+  path = Path(STATE_PATH)
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text(
+    json.dumps(state, ensure_ascii=False, indent=2),
     encoding="utf-8",
   )
 
 
-def ensure(state: dict[str, Any]) -> None:
-  state.setdefault("games", {})
-  state.setdefault("known_users", {})
-  state.setdefault("draft", {})
-
-
-def get_game(state: dict[str, Any], lobby_chat_id: int) -> Optional[dict[str, Any]]:
-  ensure(state)
-  return state["games"].get(str(lobby_chat_id))
-
-
-def set_game(state: dict[str, Any], lobby_chat_id: int, game: Optional[dict[str, Any]]) -> None:
-  ensure(state)
-  key = str(lobby_chat_id)
-  if game is None:
-    state["games"].pop(key, None)
-  else:
-    state["games"][key] = game
-
-
-def remember_user(state: dict[str, Any], user: Any) -> None:
-  ensure(state)
-  uid = int(user.id)
-  username = (user.username or "").lower() or None
-  state["known_users"][str(uid)] = {
-    "name": user.full_name or "user",
-    "username": username,
-    "updated_at": int(time.time()),
-  }
-
-
-def user_id_by_username(state: dict[str, Any], username: str) -> Optional[int]:
-  ensure(state)
-  username = username.lower().lstrip("@")
-  for uid_str, info in state["known_users"].items():
-    if (info or {}).get("username") == username:
-      return int(uid_str)
+def get_game(state: dict[str, Any], chat_id: int) -> dict[str, Any] | None:
+  games = state.setdefault("games", {})
+  game = games.get(str(int(chat_id)))
+  if isinstance(game, dict):
+    return game
   return None
 
 
-def draft_get(state: dict[str, Any], uid: int) -> Optional[dict[str, Any]]:
-  ensure(state)
-  return state["draft"].get(str(int(uid)))
+def set_game(state: dict[str, Any], chat_id: int, game: dict[str, Any] | None) -> None:
+  games = state.setdefault("games", {})
+  key = str(int(chat_id))
+  if game is None:
+    games.pop(key, None)
+    return
+  games[key] = game
 
 
-def draft_set(state: dict[str, Any], uid: int, value: Optional[dict[str, Any]]) -> None:
-  ensure(state)
-  key = str(int(uid))
-  if value is None:
-    state["draft"].pop(key, None)
-  else:
-    state["draft"][key] = value
+def draft_get(state: dict[str, Any], user_id: int) -> dict[str, Any] | None:
+  drafts = state.setdefault("drafts", {})
+  value = drafts.get(str(int(user_id)))
+  if isinstance(value, dict):
+    return value
+  return None
 
 
-def mention(player: dict[str, Any]) -> str:
-  u = player.get("username")
-  if u:
-    return f"@{u}"
-  return player.get("name", "user")
+def draft_set(state: dict[str, Any], user_id: int, draft: dict[str, Any] | None) -> None:
+  drafts = state.setdefault("drafts", {})
+  key = str(int(user_id))
+  if draft is None:
+    drafts.pop(key, None)
+    return
+  drafts[key] = draft
+
+
+def remember_user(state: dict[str, Any], user: Any) -> None:
+  users = state.setdefault("users", {})
+  uid = str(int(user.id))
+  username = (getattr(user, "username", None) or "").strip().lower() or None
+  full_name = (getattr(user, "full_name", None) or "").strip() or "user"
+
+  row = users.get(uid)
+  if not isinstance(row, dict):
+    row = {}
+
+  row["id"] = int(user.id)
+  row["username"] = username
+  row["full_name"] = full_name
+  users[uid] = row
+
+
+def user_id_by_username(state: dict[str, Any], username: str) -> int | None:
+  target = (username or "").strip().lstrip("@").lower()
+  if not target:
+    return None
+
+  users = state.setdefault("users", {})
+  for uid, row in users.items():
+    if not isinstance(row, dict):
+      continue
+    if (row.get("username") or "").lower() == target:
+      try:
+        return int(uid)
+      except Exception:
+        return None
+  return None
+
+
+def mention(user_row: dict[str, Any] | None) -> str:
+  if not isinstance(user_row, dict):
+    return "игрок"
+
+  username = (user_row.get("username") or "").strip()
+  if username:
+    return f"@{username}"
+
+  name = (user_row.get("name") or user_row.get("full_name") or "").strip()
+  if name:
+    return name
+
+  uid = user_row.get("id")
+  if uid is not None:
+    return str(uid)
+
+  return "игрок"

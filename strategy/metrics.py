@@ -1,25 +1,19 @@
+from __future__ import annotations
+
 from .types import BeliefState
 
-N_PLAYERS = 2
+
+DEFAULT_FACTS_PER_PLAYER = 4
 
 
-def calc_sa(belief: BeliefState) -> float:
-  """
-  Простая метрика SA:
-  G = число известных фактов / общее число фактов.
+def calc_sa(belief: BeliefState, players_count: int | None = None) -> float:
+  if players_count is None:
+    players = set(belief.houses) | set(belief.pets) | set(belief.drinks) | set(belief.smokes)
+    players_count = len(players)
 
-  Факты: дом, питомец, напиток, сигареты для каждого игрока.
-  Итого 4 * N_PLAYERS факта.
-  """
-  total_facts = 4 * N_PLAYERS
-  if total_facts == 0:
+  if players_count <= 0:
     return 0.0
 
-  known_facts = (
-    len(belief.houses)
-    + len(belief.pets)
-    + len(belief.drinks)
-    + len(belief.smokes)
-  )
-
-  return known_facts / total_facts
+  total_facts = DEFAULT_FACTS_PER_PLAYER * players_count
+  known_facts = belief.known_facts_count()
+  return known_facts / total_facts if total_facts > 0 else 0.0

@@ -1,85 +1,178 @@
+from __future__ import annotations
+
 import argparse
 import csv
+import statistics
 import time
 from pathlib import Path
-from typing import List
+from typing import Any
 
-import random
-
-from simulator.batch_sim import build_agents, run_sim
+from simulator.engine import run_session
 
 
-def mean(xs: List[float]) -> float:
-  return sum(xs) / len(xs) if xs else 0.0
+def _read_metrics_ext_last(metrics_ext_path: Path) -> dict[str, dict[str, str]]:
+  if not metrics_ext_path.exists():
+    return {}
+
+  with metrics_ext_path.open("r", encoding="utf-8", newline="") as handle:
+    reader = csv.DictReader(handle)
+    rows = list(reader)
+
+  by_agent: dict[str, dict[str, str]] = {}
+  for row in rows:
+    agent = str(row.get("agent") or "")
+    if not agent:
+      continue
+    by_agent[agent] = row
+  return by_agent
 
 
-def std(xs: List[float]) -> float:
-  if len(xs) < 2:
+def _mean(values: list[float]) -> float:
+  if not values:
     return 0.0
-  m = mean(xs)
-  var = sum((x - m) ** 2 for x in xs) / (len(xs) - 1)
-  return var ** 0.5
+  return float(statistics.fmean(values))
+
+
+def _aggregate_agents(by_agent: dict[str, dict[str, str]]) -> dict[str, float]:
+  m1_values: list[float] = []
+  m2_values: list[float] = []
+  resolved_values: list[float] = []
+
+  for row in by_agent.values():
+    try:
+      m1_values.append(float(row.get("m1_personal", 0.0)))
+    except Exception:
+      pass
+    try:
+      m2_values.append(float(row.get("m2_zebra", 0.0)))
+    except Exception:
+      pass
+    try:
+      resolved_values.append(float(row.get("zebra_resolved", 0.0)))
+    except Exception:
+      pass
+
+  return {
+    "final_m1_avg": _mean(m1_values),
+    "final_m2_avg": _mean(m2_values),
+    "final_zebra_resolved_avg": _mean(resolved_values),
+  }
+
+
+def run_bench(
+  max_agents: int,
+  step: int,
+  days: int,
+  runs: int,
+  houses: int,
+  share: str,
+  graph: str,
+  noise: float,
+  out_dir: Path,
+) -> Path:
+  out_dir.mkdir(parents=True, exist_ok=True)
+  out_path = out_dir / "bench.csv"
+
+  header = [
+    "agents",
+    "houses",
+    "days",
+    "runs",
+    "share",
+    "graph",
+    "noise",
+    "run_index",
+    "seed",
+    "elapsed_sec",
+    "final_m1_avg",
+    "final_m2_avg",
+    "final_zebra_resolved_avg",
+    "session_id",
+    "metrics_path",
+    "metrics_ext_path",
+    "events_path",
+    "xml_path",
+  ]
+
+  with out_path.open("w", encoding="utf-8", newline="") as handle:
+    writer = csv.writer(handle)
+    writer.writerow(header)
+
+    for agents in range(step, max_agents + 1, step):
+      for run_index in range(1, runs + 1):
+        seed = run_index
+        session_id = f"bench_a{agents}_r{run_index}"
+        cfg: dict[str, Any] = {
+          "agents": agents,
+          "houses": houses,
+          "days": days,
+          "share": share,
+          "graph": graph,
+          "noise": noise,
+          "seed": seed,
+        }
+
+        started = time.perf_counter()
+        result = run_session(session_id, cfg, out_dir)
+        elapsed = time.perf_counter() - started
+
+        by_agent = _read_metrics_ext_last(Path(result["metrics_ext"]))
+        agg = _aggregate_agents(by_agent)
+
+        writer.writerow(
+          [
+            agents,
+            houses,
+            days,
+            runs,
+            share,
+            graph,
+            noise,
+            run_index,
+            seed,
+            f"{elapsed:.6f}",
+            f"{agg['final_m1_avg']:.6f}",
+            f"{agg['final_m2_avg']:.6f}",
+            f"{agg['final_zebra_resolved_avg']:.6f}",
+            session_id,
+            str(result["metrics"]),
+            str(result["metrics_ext"]),
+            str(result["csv"]),
+            str(result["xml"]),
+          ]
+        )
+
+  return out_path
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+  parser = argparse.ArgumentParser(description="Benchmark Zebra simulation")
+  parser.add_argument("--max_agents", type=int, default=100)
+  parser.add_argument("--step", type=int, default=10)
+  parser.add_argument("--days", type=int, default=50)
+  parser.add_argument("--runs", type=int, default=3)
+  parser.add_argument("--houses", type=int, default=6)
+  parser.add_argument("--share", type=str, default="meet")
+  parser.add_argument("--graph", type=str, default="ring")
+  parser.add_argument("--noise", type=float, default=0.0)
+  parser.add_argument("--out_dir", type=str, default="data/logs")
+  return parser
 
 
 def main() -> None:
-  ap = argparse.ArgumentParser()
-  ap.add_argument("--max_agents", type = int, default = 1000)
-  ap.add_argument("--step", type = int, default = 50)
-  ap.add_argument("--days", type = int, default = 200)
-  ap.add_argument("--runs", type = int, default = 5)
-  ap.add_argument("--seed", type = int, default = 1)
-  ap.add_argument("--share", choices = ["none", "meet"], default = "none")
-  ap.add_argument("--houses", type = int, default = 6)
-  ap.add_argument("--noise", type = float, default = 0.0)
-  ap.add_argument("--out", type = str, default = "data/logs/bench.csv")
-  args = ap.parse_args()
-
-  rows = []
-
-  for n in range(args.step, args.max_agents + 1, args.step):
-    times_ms: List[float] = []
-
-    for r in range(args.runs):
-      agents, domains, houses = build_agents(
-        n_agents = n,
-        houses = args.houses,
-        seed = args.seed + r,
-        zebra_init = "data/zebra-01.csv",
-        zebra_strat = "data/ZEBRA-strategies.csv",
-      )
-
-      rng = random.Random(args.seed + r)
-
-      t0 = time.perf_counter()
-      run_sim(
-        agents = agents,
-        days = args.days,
-        rng = rng,
-        share_mode = args.share,
-        noise = args.noise,
-        n_houses = houses,
-        domains = domains,
-        log_path = None,
-        sa_path = None,
-        sa_sample = 50,
-      )
-      t1 = time.perf_counter()
-
-      times_ms.append((t1 - t0) * 1000.0)
-
-    avg_ms = mean(times_ms)
-    std_ms = std(times_ms)
-    rows.append([n, avg_ms, std_ms])
-    print(f"n = {n} avg_ms ={ avg_ms:.1f} std_ms = {std_ms:.1f}")
-
-  out = Path(args.out)
-  out.parent.mkdir(parents = True, exist_ok = True)
-  with out.open("w", newline = "") as f:
-    w = csv.writer(f, delimiter = ";")
-    w.writerow(["n_agents", "t_ms_avg", "t_ms_std"])
-    w.writerows(rows)
-
-  print(f"saved {out}")
+  args = build_arg_parser().parse_args()
+  out_path = run_bench(
+    max_agents=args.max_agents,
+    step=args.step,
+    days=args.days,
+    runs=args.runs,
+    houses=args.houses,
+    share=args.share,
+    graph=args.graph,
+    noise=args.noise,
+    out_dir=Path(args.out_dir),
+  )
+  print(out_path)
 
 
 if __name__ == "__main__":

@@ -3,14 +3,22 @@ from __future__ import annotations
 import csv
 import random
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
+from core.logic import (
+  build_belief_snapshot,
+  build_truth_snapshot,
+  evaluate_agent_metrics,
+  merge_knowledge_group,
+  observe_house,
+  observe_person,
+  random_forget,
+  write_xml_log,
+)
+from core.schema import Agent
 from simulator.world import (
   DRINKS_6,
-  KNOWLEDGE_CATEGORIES,
-  M1_CATEGORIES,
   PETS_6,
   SMOKES_6,
   clamp_int,
@@ -23,117 +31,6 @@ from simulator.world import (
 )
 
 
-@dataclass
-class KnowledgeEntry:
-  value: str
-  day: int
-
-
-@dataclass
-class Trip:
-  active: bool = False
-  src: int = 1
-  dst: int = 1
-  remaining: int = 0
-  start_event_id: int = 0
-
-
-@dataclass
-class Agent:
-  name: str
-  home: int
-  location: int
-  pet: str
-  drink: str
-  smoke: str
-  trip: Trip = field(default_factory = Trip)
-  knowledge: dict[tuple[int, str], KnowledgeEntry] = field(default_factory = dict)
-
-
-def _xml_escape(text: str) -> str:
-  return (
-    text.replace("&", "&amp;")
-    .replace("<", "&lt;")
-    .replace(">", "&gt;")
-    .replace('"', "&quot;")
-    .replace("'", "&apos;")
-  )
-
-
-def _write_xml(path: Path, session_id: str, events: list[dict[str, Any]]) -> None:
-  lines = [f'<log session="{session_id}">', "  <events>"]
-  for event in events:
-    lines.append(f'    <event id="{event["id"]}" day="{event["day"]}" type="{event["type"]}">')
-    for index, arg in enumerate(event.get("args", []), start = 1):
-      lines.append(f'      <arg i="{index}">{_xml_escape(str(arg))}</arg>')
-    lines.append("    </event>")
-  lines.append("  </events>")
-  lines.append("</log>")
-  path.write_text("\n".join(lines), encoding = "utf-8")
-
-
-def _fact_value(houses: list[Any], by_home: dict[int, Agent], house_id: int, category: str) -> str:
-  if category == "color":
-    return houses[house_id - 1].color
-  resident = by_home[house_id]
-  if category == "nationality":
-    return resident.name
-  if category == "pet":
-    return resident.pet
-  if category == "drink":
-    return resident.drink
-  if category == "smoke":
-    return resident.smoke
-  return ""
-
-
-def _observe_house(agent: Agent, day: int, house_id: int, houses: list[Any], by_home: dict[int, Agent]) -> None:
-  resident = by_home[house_id]
-  facts = {
-    "color": houses[house_id - 1].color,
-    "nationality": resident.name,
-    "pet": resident.pet,
-    "drink": resident.drink,
-    "smoke": resident.smoke,
-  }
-  for category, value in facts.items():
-    agent.knowledge[(house_id, category)] = KnowledgeEntry(str(value), day)
-
-
-def _observe_person(agent: Agent, day: int, other: Agent) -> None:
-  for category, value in (
-    ("nationality", other.name),
-    ("pet", other.pet),
-    ("drink", other.drink),
-    ("smoke", other.smoke),
-  ):
-    agent.knowledge[(other.home, category)] = KnowledgeEntry(str(value), day)
-
-
-def _merge_knowledge(group: list[Agent]) -> None:
-  merged: dict[tuple[int, str], KnowledgeEntry] = {}
-  for agent in group:
-    for key, entry in agent.knowledge.items():
-      current = merged.get(key)
-      if current is None or entry.day > current.day:
-        merged[key] = entry
-  for agent in group:
-    agent.knowledge = dict(merged)
-
-
-def _m1(agent: Agent, houses: list[Any], by_home: dict[int, Agent]) -> float:
-  total = len(houses) * len(M1_CATEGORIES)
-  known = 0
-  for house_id in range(1, len(houses) + 1):
-    for category in M1_CATEGORIES:
-      entry = agent.knowledge.get((house_id, category))
-      if entry is None:
-        continue
-      if entry.value == _fact_value(houses, by_home, house_id, category):
-        known += 1
-  return known / float(total) if total else 0.0
-
-
 def _neighbor_left(houses_n: int, house: int) -> int:
   return house - 1 if house > 1 else houses_n
 
@@ -142,8 +39,16 @@ def _neighbor_right(houses_n: int, house: int) -> int:
   return house + 1 if house < houses_n else 1
 
 
+def _safe_resident_by_home(agents: list[Agent]) -> dict[int, Agent]:
+  by_home: dict[int, Agent] = {}
+  for agent in agents:
+    if agent.home not in by_home:
+      by_home[agent.home] = agent
+  return by_home
+
+
 def run_session(session_id: str, cfg: dict[str, Any], log_dir: Path) -> dict[str, Any]:
-  log_dir.mkdir(parents = True, exist_ok = True)
+  log_dir.mkdir(parents=True, exist_ok=True)
 
   agents_n = int(cfg.get("agents", 6))
   houses_n = int(cfg.get("houses", 6))
@@ -175,18 +80,29 @@ def run_session(session_id: str, cfg: dict[str, Any], log_dir: Path) -> dict[str
       pet = f"pet_{index}"
       drink = f"drink_{index}"
       smoke = f"smoke_{index}"
-    agents.append(Agent(name = name, home = home, location = home, pet = pet, drink = drink, smoke = smoke))
 
-  def by_home() -> dict[int, Agent]:
-    return {agent.home: agent for agent in agents}
+    agents.append(
+      Agent(
+        name=name,
+        home=home,
+        location=home,
+        pet=pet,
+        drink=drink,
+        smoke=smoke,
+      )
+    )
 
   def strategy_for(agent: Agent) -> dict[str, Any]:
-    base = defaults.get(agent.name, {
-      "p_to": normalize_probs([1] * houses_n),
-      "p_house_exch": 0,
-      "p_pet_exch": 0,
-    })
+    base = defaults.get(
+      agent.name,
+      {
+        "p_to": normalize_probs([1] * houses_n),
+        "p_house_exch": 0,
+        "p_pet_exch": 0,
+      },
+    )
     override = custom_strategies.get(agent.name, {}) if isinstance(custom_strategies, dict) else {}
+
     if mt_who is not None and mt_strategy is not None and agent.name == mt_who:
       try:
         override = dict(override)
@@ -204,8 +120,9 @@ def run_session(session_id: str, cfg: dict[str, Any], log_dir: Path) -> dict[str
       "p_pet_exch": clamp_int(override.get("p_pet_exch", base.get("p_pet_exch", 0)), 0, 100),
     }
 
+  resident_map = _safe_resident_by_home(agents)
   for agent in agents:
-    _observe_house(agent, 0, agent.home, houses, by_home())
+    observe_house(agent, 0, agent.home, houses, resident_map.get(agent.home))
 
   event_rows: list[list[str]] = []
   xml_events: list[dict[str, Any]] = []
@@ -214,15 +131,15 @@ def run_session(session_id: str, cfg: dict[str, Any], log_dir: Path) -> dict[str
   def log_event(day: int, kind: str, *args: Any) -> int:
     nonlocal event_id
     event_id += 1
-    row = [str(event_id), str(day), str(kind)]
-    row.extend("" if arg is None else str(arg) for arg in args)
-    event_rows.append(row)
-    xml_events.append({
-      "id": event_id,
-      "day": day,
-      "type": kind,
-      "args": ["" if arg is None else str(arg) for arg in args],
-    })
+    event_rows.append([str(event_id), str(day), str(kind), *["" if arg is None else str(arg) for arg in args]])
+    xml_events.append(
+      {
+        "id": event_id,
+        "day": day,
+        "type": kind,
+        "args": ["" if arg is None else str(arg) for arg in args],
+      }
+    )
     return event_id
 
   def start_trip(day: int, agent: Agent, dst: int) -> None:
@@ -250,12 +167,32 @@ def run_session(session_id: str, cfg: dict[str, Any], log_dir: Path) -> dict[str
     agent.trip.start_event_id = log_event(day, "startTrip", agent.name, agent.location, agent.home)
 
   metrics_path = log_dir / f"metrics_{session_id}.csv"
+  metrics_ext_path = log_dir / f"metrics_ext_{session_id}.csv"
   events_path = log_dir / f"game_{session_id}.csv"
   xml_path = log_dir / f"game_{session_id}.xml"
 
-  with metrics_path.open("w", newline = "", encoding = "utf-8") as metrics_file:
+  with (
+    metrics_path.open("w", newline="", encoding="utf-8") as metrics_file,
+    metrics_ext_path.open("w", newline="", encoding="utf-8") as metrics_ext_file,
+  ):
     metrics_writer = csv.writer(metrics_file)
+    metrics_ext_writer = csv.writer(metrics_ext_file)
+
     metrics_writer.writerow(["day"] + [agent.name for agent in agents])
+    metrics_ext_writer.writerow(
+      [
+        "day",
+        "agent",
+        "m1_personal",
+        "m2_zebra",
+        "known_personal_facts",
+        "correct_personal_facts",
+        "total_personal_facts",
+        "zebra_resolved",
+        "zebra_owner_pred",
+        "zebra_owner_true",
+      ]
+    )
 
     for day in range(1, days + 1):
       if sleep_ms_per_day > 0:
@@ -271,10 +208,10 @@ def run_session(session_id: str, cfg: dict[str, Any], log_dir: Path) -> dict[str
           agent.location = agent.trip.dst
           arrivals.append(agent)
 
-      home_map = by_home()
+      resident_map = _safe_resident_by_home(agents)
       for agent in arrivals:
-        host = home_map.get(agent.location)
-        success = 1 if host is not None and (not host.trip.active) and host.location == agent.location else 0
+        host = resident_map.get(agent.location)
+        success = int(host is not None and not host.trip.active and host.location == agent.location)
         log_event(day, "FinishTrip", agent.trip.start_event_id, agent.name, success)
         if success == 0:
           start_return_trip(day, agent)
@@ -291,67 +228,84 @@ def run_session(session_id: str, cfg: dict[str, Any], log_dir: Path) -> dict[str
 
         for agent in group:
           strategy = strategy_for(agent)
-          if rng.randint(1, 100) <= int(strategy["p_house_exch"]):
-            others = [other for other in group if other.name != agent.name]
-            if others:
-              other = rng.choice(others)
-              agent.home, other.home = other.home, agent.home
-              log_event(day, "changeHouse", 2, agent.name, other.name, agent.home, other.home)
+          others = [other for other in group if other.name != agent.name]
+          if not others:
+            continue
 
           if rng.randint(1, 100) <= int(strategy["p_pet_exch"]):
-            others = [other for other in group if other.name != agent.name]
-            if others:
-              other = rng.choice(others)
-              agent.pet, other.pet = other.pet, agent.pet
-              log_event(day, "changePet", 2, agent.name, other.name, agent.pet, other.pet)
+            other = rng.choice(others)
+            agent.pet, other.pet = other.pet, agent.pet
+            log_event(day, "changePet", 2, agent.name, other.name, agent.pet, other.pet)
 
         if share == "meet":
-          updated_home_map = by_home()
+          resident_map = _safe_resident_by_home(agents)
           for agent in group:
-            _observe_house(agent, day, location, houses, updated_home_map)
+            observe_house(agent, day, location, houses, resident_map.get(location))
           for agent in group:
             for other in group:
               if agent is other:
                 continue
-              _observe_person(agent, day, other)
-          _merge_knowledge(group)
+              observe_person(agent, day, other)
+          merge_knowledge_group(group)
+
+      for agent in agents:
+        if not agent.trip.active:
+          agent.location = agent.home
 
       for agent in agents:
         if agent.trip.active:
           continue
 
         strategy = strategy_for(agent)
-        candidates = list(range(1, houses_n + 1))
-        probs = list(strategy["p_to"])
-
-        if graph != "full":
-          allowed = [agent.location, _neighbor_left(houses_n, agent.location), _neighbor_right(houses_n, agent.location)]
-          candidates = allowed
-          probs = [probs[house - 1] for house in candidates]
+        candidates = [
+          agent.home,
+          _neighbor_left(houses_n, agent.home),
+          _neighbor_right(houses_n, agent.home),
+        ]
+        probs_full = list(strategy["p_to"])
+        probs = [probs_full[house - 1] for house in candidates]
 
         dst = pick_by_probs(rng, candidates, probs)
-        if dst == agent.location:
-          continue
-        start_trip(day, agent, dst)
+        if dst != agent.home:
+          start_trip(day, agent, dst)
 
       if noise > 0.0:
         for agent in agents:
-          if rng.random() < noise and agent.knowledge:
-            key = rng.choice(list(agent.knowledge.keys()))
-            agent.knowledge.pop(key, None)
+          if rng.random() < noise:
+            random_forget(agent, rng)
 
-      current_home_map = by_home()
-      metrics_writer.writerow([day] + [f"{_m1(agent, houses, current_home_map):.6f}" for agent in agents])
+      truth = build_truth_snapshot(houses, agents)
+      day_scores: list[str] = []
+      for agent in agents:
+        belief = build_belief_snapshot(agent.knowledge)
+        metric = evaluate_agent_metrics(truth, belief)
+        day_scores.append(f"{metric.m1_personal:.6f}")
+        metrics_ext_writer.writerow(
+          [
+            str(day),
+            agent.name,
+            f"{metric.m1_personal:.6f}",
+            str(metric.m2_zebra),
+            str(metric.known_personal_facts),
+            str(metric.correct_personal_facts),
+            str(metric.total_personal_facts),
+            str(int(metric.zebra_resolved)),
+            "" if metric.zebra_owner_pred is None else metric.zebra_owner_pred,
+            "" if metric.zebra_owner_true is None else metric.zebra_owner_true,
+          ]
+        )
+      metrics_writer.writerow([day] + day_scores)
 
-  with events_path.open("w", newline = "", encoding = "utf-8") as events_file:
+  with events_path.open("w", newline="", encoding="utf-8") as events_file:
     events_file.write("eventID;day;event;...\n")
     for row in event_rows:
       events_file.write(";".join(row) + "\n")
 
-  _write_xml(xml_path, session_id, xml_events)
+  write_xml_log(xml_path, session_id, xml_events)
   return {
     "csv": events_path,
     "xml": xml_path,
     "metrics": metrics_path,
+    "metrics_ext": metrics_ext_path,
     "finished_at": time.time(),
   }

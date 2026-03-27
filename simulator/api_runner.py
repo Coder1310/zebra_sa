@@ -1,109 +1,90 @@
 from __future__ import annotations
 
 import argparse
-import time
-from typing import Any, Dict, Optional
+import json
+from typing import Any
 
 import requests
 
 
-def _as_sid(obj: Any) -> str:
-  if isinstance(obj, dict) and "session_id" in obj:
-    val = obj["session_id"]
-    if isinstance(val, str):
-      return val
-    if isinstance(val, dict) and "session_id" in val and isinstance(val["session_id"], str):
-      return val["session_id"]
-  if isinstance(obj, str):
-    return obj
-  raise RuntimeError(f"cannot parse session_id from: {obj}")
-
-
-def _pick_path(payload: Dict[str, Any], key: str) -> Optional[str]:
-  if key not in payload:
-    return None
-  val = payload[key]
-  if isinstance(val, str):
-    return val
-  if isinstance(val, dict) and "path" in val and isinstance(val["path"], str):
-    return val["path"]
-  return None
-
-
-def _post_json(url: str, json_data: Dict[str, Any], timeout: float) -> Dict[str, Any]:
-  r = requests.post(url, json = json_data, timeout = timeout)
-  r.raise_for_status()
-  data = r.json()
+def _post_json(base_url: str, path: str, payload: dict[str, Any], timeout: int = 600) -> dict[str, Any]:
+  response = requests.post(
+    f"{base_url.rstrip('/')}{path}",
+    json=payload,
+    timeout=timeout,
+  )
+  response.raise_for_status()
+  data = response.json()
   if not isinstance(data, dict):
-    raise RuntimeError(f"unexpected json at {url}: {data}")
+    raise RuntimeError(f"unexpected response for {path}")
   return data
 
 
-def _create_session(api: str, cfg: Dict[str, Any]) -> str:
-  last_err = None
-  for path in ("/session/create", "/session"):
-    try:
-      data = _post_json(f"{api}{path}", cfg, timeout = 30.0)
-      return _as_sid(data)
-    except Exception as e:
-      last_err = e
-  raise RuntimeError(f"cannot create session, last error: {last_err}")
+def _get_json(base_url: str, path: str, timeout: int = 60) -> dict[str, Any]:
+  response = requests.get(
+    f"{base_url.rstrip('/')}{path}",
+    timeout=timeout,
+  )
+  response.raise_for_status()
+  data = response.json()
+  if not isinstance(data, dict):
+    raise RuntimeError(f"unexpected response for {path}")
+  return data
 
 
-def _start_or_run(api: str, sid: str, timeout: float) -> Dict[str, Any]:
-  last_err = None
-  for path in (f"/session/{sid}/start", f"/session/{sid}/run"):
-    try:
-      r = requests.post(f"{api}{path}", timeout = timeout)
-      r.raise_for_status()
-      data = r.json()
-      if not isinstance(data, dict):
-        raise RuntimeError(f"unexpected json at {path}: {data}")
-      return data
-    except Exception as e:
-      last_err = e
-  raise RuntimeError(f"cannot start/run session, last error: {last_err}")
+def simulate(base_url: str, cfg: dict[str, Any]) -> dict[str, Any]:
+  return _post_json(base_url, "/simulate", cfg)
+
+
+def create_session(base_url: str, cfg: dict[str, Any]) -> dict[str, Any]:
+  return _post_json(base_url, "/session/new", cfg)
+
+
+def run_session_saved(base_url: str, session_id: str) -> dict[str, Any]:
+  return _post_json(base_url, f"/session/{session_id}/run", {})
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+  parser = argparse.ArgumentParser(description="Run Zebra simulation through REST API")
+  parser.add_argument("--base-url", default="http://127.0.0.1:8000")
+  parser.add_argument("--mode", choices=["simulate", "session"], default="simulate")
+  parser.add_argument("--agents", type=int, default=6)
+  parser.add_argument("--houses", type=int, default=6)
+  parser.add_argument("--days", type=int, default=50)
+  parser.add_argument("--share", type=str, default="meet")
+  parser.add_argument("--noise", type=float, default=0.0)
+  parser.add_argument("--graph", type=str, default="ring")
+  parser.add_argument("--seed", type=int, default=1)
+  parser.add_argument("--sleep-ms-per-day", type=int, default=0)
+  return parser
 
 
 def main() -> None:
-  p = argparse.ArgumentParser()
-  p.add_argument("--api", default = "http://127.0.0.1:8000")
-  p.add_argument("--agents", type = int, default = 6)
-  p.add_argument("--houses", type = int, default = 6)
-  p.add_argument("--days", type = int, default = 200)
-  p.add_argument("--share", default = "none")
-  p.add_argument("--noise", type = float, default = 0.0)
-  p.add_argument("--seed", type = int, default = None)
+  args = build_arg_parser().parse_args()
 
-  args = p.parse_args()
-
-  cfg: Dict[str, Any] = {
+  cfg = {
     "agents": args.agents,
     "houses": args.houses,
     "days": args.days,
     "share": args.share,
     "noise": args.noise,
+    "graph": args.graph,
+    "seed": args.seed,
+    "sleep_ms_per_day": args.sleep_ms_per_day,
   }
-  if args.seed is not None:
-    cfg["seed"] = args.seed
 
-  sid = _create_session(args.api, cfg)
+  if args.mode == "simulate":
+    result = simulate(args.base_url, cfg)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return
 
-  start_t = time.time()
-  data = _start_or_run(args.api, sid, timeout = 600.0)
-  _ = start_t
+  created = create_session(args.base_url, cfg)
+  session_id = str(created.get("session_id") or "")
+  if not session_id:
+    raise RuntimeError("server did not return session_id")
 
-  csv_path = _pick_path(data, "csv")
-  xml_path = _pick_path(data, "xml")
-  metrics_path = _pick_path(data, "metrics")
-
-  if csv_path is None or xml_path is None or metrics_path is None:
-    raise RuntimeError(f"server did not return csv/xml/metrics paths: {data}")
-
-  print(f"session = {sid}")
-  print(f"csv = {csv_path}")
-  print(f"xml = {xml_path}")
-  print(f"metrics = {metrics_path}")
+  result = run_session_saved(args.base_url, session_id)
+  print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

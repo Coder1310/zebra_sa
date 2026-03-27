@@ -1,42 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-python -m analysis.bench --max_agents 1000 --step 50 --days 200 --runs 5 --houses 6 --share none --out data/logs/bench_none.csv
-python -m analysis.bench --max_agents 1000 --step 50 --days 200 --runs 5 --houses 6 --share meet --out data/logs/bench_meet.csv
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT_DIR"
 
-python -m analysis.plot_bench \
-  --inputs data/logs/bench_none.csv data/logs/bench_meet.csv \
-  --labels none meet \
-  --out data/logs/bench.png
+if [ -f ".env" ]; then
+  set -a
+  source .env
+  set +a
+fi
 
-for s in 1 2 3 4 5; do
-  python -m simulator.batch_sim --agents 1000 --houses 6 --days 200 --seed $s --share none --noise 0.0 --log 0 --sa 1
-  mv data/logs/batch_sa.csv data/logs/sa_none_seed${s}.csv
-done
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+HOST="${ZEBRA_HOST:-127.0.0.1}"
+PORT="${ZEBRA_PORT:-8000}"
+API_URL="http://$HOST:$PORT"
 
-for s in 1 2 3 4 5; do
-  python -m simulator.batch_sim --agents 1000 --houses 6 --days 200 --seed $s --share meet --noise 0.0 --log 0 --sa 1
-  mv data/logs/batch_sa.csv data/logs/sa_meet_seed${s}.csv
-done
+if [ -z "${BOT_TOKEN:-}" ]; then
+  echo "BOT_TOKEN is not set"
+  exit 1
+fi
 
-python -m analysis.plot_sa_compare \
-  --none "data/logs/sa_none_seed*.csv" \
-  --meet "data/logs/sa_meet_seed*.csv" \
-  --metric m1 \
-  --out data/logs/sa_compare_m1.png
+export ZEBRA_API="${ZEBRA_API:-$API_URL}"
 
-for s in 1 2 3 4 5; do
-  python -m simulator.batch_sim --agents 1000 --houses 6 --days 200 --seed $s --share meet --noise 0.2 --log 0 --sa 1
-  mv data/logs/batch_sa.csv data/logs/sa_meet_noise02_seed${s}.csv
-done
+cleanup() {
+  jobs -p | xargs -r kill
+}
+trap cleanup EXIT
 
-python -m analysis.plot_sa_3curves \
-  --none "data/logs/sa_none_seed*.csv" \
-  --meet "data/logs/sa_meet_seed*.csv" \
-  --noise "data/logs/sa_meet_noise02_seed*.csv" \
-  --metric m1 \
-  --out data/logs/sa_m1_3curves.png
-
-python -m simulator.batch_sim --agents 6 --houses 6 --days 50 --seed 1 --share meet --noise 0.0 --log 1 --sa 1 --sa_sample 0
-
-echo "done: data/logs/bench.png data/logs/sa_compare_m1.png data/logs/sa_m1_3curves.png data/logs/batch_log.csv"
+"$PYTHON_BIN" -m uvicorn server.main:app --host "$HOST" --port "$PORT" --reload &
+sleep 2
+exec "$PYTHON_BIN" -m zebra_bot.main

@@ -1,58 +1,67 @@
 from __future__ import annotations
 
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from simulator.world import ROLES_6
 
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
 LOGS_DIR = DATA_DIR / "logs"
-BOT_STATE_PATH = LOGS_DIR / "bot_state.yaml"
+STATE_PATH = DATA_DIR / "bot_state.json"
 
 
-@dataclass
-class Defaults:
-  players: int = 6
-  houses: int = 6
-  days: int = 50
-  share: str = "meet"
-  noise: float = 0.2
-  graph: str = "ring"
-  lobby_delay_sec: int = 60
-  turn_delay_sec: int = 30
-  vote_delay_sec: int = 30
+def _env_int(name: str, default: int) -> int:
+  try:
+    return int(os.getenv(name, str(default)).strip())
+  except Exception:
+    return default
 
 
-DEFAULTS = Defaults()
+def _env_float(name: str, default: float) -> float:
+  try:
+    return float(os.getenv(name, str(default)).strip())
+  except Exception:
+    return default
 
 
-def defaults_dict() -> dict:
-  return asdict(DEFAULTS)
+@dataclass(frozen=True)
+class BotDefaults:
+  players: int = _env_int("ZEBRA_PLAYERS", 6)
+  houses: int = _env_int("ZEBRA_HOUSES", 6)
+  days: int = _env_int("ZEBRA_DAYS", 50)
+  share: str = os.getenv("ZEBRA_SHARE", "meet").strip() or "meet"
+  noise: float = _env_float("ZEBRA_NOISE", 0.0)
+  graph: str = os.getenv("ZEBRA_GRAPH", "ring").strip() or "ring"
+  seed: int | None = None
+  lobby_delay_sec: int = _env_int("ZEBRA_LOBBY_DELAY_SEC", 90)
+  turn_delay_sec: int = _env_int("ZEBRA_TURN_DELAY_SEC", 60)
+  vote_delay_sec: int = _env_int("ZEBRA_VOTE_DELAY_SEC", 45)
 
 
-def load_dotenv(path: Path) -> None:
-  if not path.exists():
-    return
-  for raw_line in path.read_text(encoding = "utf-8").splitlines():
-    line = raw_line.strip()
-    if not line or line.startswith("#") or "=" not in line:
-      continue
-    key, value = line.split("=", 1)
-    key = key.strip()
-    value = value.strip().strip('"').strip("'")
-    if key and key not in os.environ:
-      os.environ[key] = value
+DEFAULTS = BotDefaults()
 
 
-def env(name: str) -> str:
-  value = os.getenv(name)
-  if not value:
-    raise RuntimeError(f"env {name} is required")
-  return value
+def BOT_TOKEN() -> str:
+  return os.getenv("BOT_TOKEN", "").strip()
 
 
 def api_base() -> str:
-  return os.getenv("ZEBRA_API", "http://127.0.0.1:8000")
+  return os.getenv("ZEBRA_API", "http://127.0.0.1:8000").strip()
+
+
+def defaults_dict() -> dict[str, Any]:
+  return {
+    "players": DEFAULTS.players,
+    "houses": DEFAULTS.houses,
+    "days": DEFAULTS.days,
+    "share": DEFAULTS.share,
+    "noise": DEFAULTS.noise,
+    "graph": DEFAULTS.graph,
+    "seed": DEFAULTS.seed,
+    "lobby_delay_sec": DEFAULTS.lobby_delay_sec,
+    "turn_delay_sec": DEFAULTS.turn_delay_sec,
+    "vote_delay_sec": DEFAULTS.vote_delay_sec,
+    "strategies": None,
+  }

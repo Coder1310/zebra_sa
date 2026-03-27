@@ -15,7 +15,7 @@ KNOWLEDGE_CATEGORIES = ("color", "nationality", "pet", "drink", "smoke")
 M1_CATEGORIES = ("nationality", "pet", "drink", "smoke")
 
 
-@dataclass(frozen = True)
+@dataclass(frozen=True)
 class House:
   house_id: int
   color: str
@@ -40,21 +40,23 @@ FULL_GRAPH_6 = {
 }
 
 
-def clamp_int(x: Any, lo: int, hi: int) -> int:
+def clamp_int(value: Any, lower: int, upper: int) -> int:
   try:
-    value = int(x)
+    number = int(value)
   except Exception:
-    return lo
-  if value < lo:
-    return lo
-  if value > hi:
-    return hi
-  return value
+    return lower
+
+  if number < lower:
+    return lower
+  if number > upper:
+    return upper
+  return number
 
 
 def normalize_probs(values: list[int]) -> list[int]:
-  clean = [max(0, int(x)) for x in values]
+  clean = [max(0, int(value)) for value in values]
   total = sum(clean)
+
   if total <= 0:
     if not clean:
       return []
@@ -69,6 +71,7 @@ def normalize_probs(values: list[int]) -> list[int]:
     normalized = int(round(100.0 * value / total))
     result.append(normalized)
     acc += normalized
+
   if result and acc != 100:
     result[-1] += 100 - acc
   return result
@@ -78,10 +81,12 @@ def pick_by_probs(rng: random.Random, items: list[int], probs: list[int]) -> int
   normalized = normalize_probs(probs)
   threshold = rng.randint(1, 100)
   prefix = 0
+
   for item, prob in zip(items, normalized):
     prefix += prob
     if threshold <= prefix:
       return item
+
   return items[-1]
 
 
@@ -93,19 +98,19 @@ def roles_for(agents: int, houses: int) -> list[str]:
 
 def houses_for(houses: int) -> list[House]:
   if houses == 6:
-    return [House(i + 1, HOUSE_COLORS_6[i]) for i in range(6)]
-  return [House(i + 1, f"Color{i + 1}") for i in range(houses)]
+    return [House(index + 1, HOUSE_COLORS_6[index]) for index in range(6)]
+  return [House(index + 1, f"Color{index + 1}") for index in range(houses)]
 
 
 def ring_distances(houses: int) -> dict[tuple[int, int], int]:
-  dist: dict[tuple[int, int], int] = {}
+  distances: dict[tuple[int, int], int] = {}
   for house in range(1, houses + 1):
     left = house - 1 if house > 1 else houses
     right = house + 1 if house < houses else 1
-    dist[(house, house)] = 0
-    dist[(house, left)] = 1
-    dist[(house, right)] = 1
-  return dist
+    distances[(house, house)] = 0
+    distances[(house, left)] = 1
+    distances[(house, right)] = 1
+  return distances
 
 
 def distances_for(graph: str, houses: int) -> dict[tuple[int, int], int]:
@@ -116,5 +121,5 @@ def distances_for(graph: str, houses: int) -> dict[tuple[int, int], int]:
 
 def default_strategies_for(houses: int) -> dict[str, dict[str, Any]]:
   if houses == 6:
-    return {name: dict(value) for name, value in DEFAULT_STRATEGIES_6.items()}
+    return {name: dict(strategy) for name, strategy in DEFAULT_STRATEGIES_6.items()}
   return {}

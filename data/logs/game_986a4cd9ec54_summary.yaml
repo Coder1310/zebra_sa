@@ -1,7 +1,0 @@
-events_summary:
-  days_max: 200
-  counts:
-    FinishTrip: 73912
-    changeHouse: 21884
-    changePet: 22004
-    startTrip: 74518
